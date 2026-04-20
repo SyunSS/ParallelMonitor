@@ -113,4 +113,4 @@ python -m PyInstaller --onefile --noconsole --windowed --name ParallelMonitor --
 PySide6>=6.5.0       # GUI 框架
 playwright>=1.40.0   # 浏览器自动化
 pyqtgraph>=0.13.0    # 数据绑图
-```****
+```
