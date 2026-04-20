@@ -70,7 +70,7 @@ python web_monitor.py
 pip install pyinstaller
 
 # 打包（带自定义图标）
-python -m PyInstaller --onefile --noconsole --windowed --name ParallelMonitor --icon=icon.ico web_monitor.py
+python -m PyInstaller --onefile --noconsole --windowed --name ParallelMonitor --icon=icon.ico ParallelMonitor.py
 
 # 打包产物位于 dist/ParallelMonitor.exe
 ```
@@ -78,7 +78,7 @@ python -m PyInstaller --onefile --noconsole --windowed --name ParallelMonitor --
 ## 📁 项目结构
 
 ```
-├── web_monitor.py      # 主程序（单文件完整应用）
+├── ParallelMonitor.py      # 主程序（单文件完整应用）
 ├── icon.ico            # 应用图标（打包用）
 ├── icon.png            # PNG 格式图标源文件
 ├── requirements.txt    # 依赖清单
