@@ -4,7 +4,7 @@
 
 ![Python 3.10+](https://img.shields.io/badge/Python-3.10+-blue.svg)
 ![Platform](https://img.shields.io/badge/Platform-Windows-green.svg)
-![License](https://img.shields.io/badge/License-MIT-yellow.svg)
+
 
 ## ✨ 功能一览
 
@@ -48,11 +48,14 @@
 
 ```bash
 pip install -r requirements.txt
-playwright install chromium
 ```
 
-> ⚠️ `playwright install chromium` 必须执行，用于安装浏览器引擎（约 290MB）
-> 优先调用Windows自带edge浏览器或chrome浏览器，若都无则调用headless chromium
+> 💡 程序会**自动调用系统已安装的 Edge 或 Chrome** 浏览器进行检测，无需额外安装浏览器引擎。
+> 只有当系统中没有 Edge 也没有 Chrome 时，才需要执行：
+>
+> ```bash
+> playwright install chromium   # 安装内置 Chromium 作为回退方案（约 290MB）
+> ```
 
 ### 运行程序
 
@@ -110,4 +113,4 @@ python -m PyInstaller --onefile --noconsole --windowed --name ParallelMonitor --
 PySide6>=6.5.0       # GUI 框架
 playwright>=1.40.0   # 浏览器自动化
 pyqtgraph>=0.13.0    # 数据绑图
-```
+```****
