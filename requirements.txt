@@ -1,0 +1,25 @@
+# ============================================
+#  网页监控工具 (Web Monitor) - 依赖清单
+# ============================================
+#
+# 安装步骤:
+#   pip install -r requirements.txt
+#
+# 浏览器说明:
+#   程序优先使用系统 Edge / Chrome，无需额外安装浏览器。
+#   仅当系统无 Edge 和 Chrome 时才需要:
+#   python -m playwright install chromium    ← 安装内置 Chromium（~290MB）
+#
+# 卸载浏览器（如果不再需要）:
+#   python -m playwright uninstall chromium      ← 删除所有 Chromium 相关文件
+#   python -m playwright uninstall --all         ← 彻底删除 Playwright 所有浏览器
+#
+# 卸载全部依赖:
+#   pip uninstall PySide6 playwright pyqtgraph
+#   python -m playwright uninstall --all
+#
+# ============================================
+
+PySide6>=6.5.0          # GUI 框架 (Qt for Python)
+playwright>=1.40.0      # 浏览器自动化引擎
+pyqtgraph>=0.13.0       # 实时数据绑图库
