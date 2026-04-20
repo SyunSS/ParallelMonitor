@@ -54,7 +54,7 @@ pip install -r requirements.txt
 > 只有当系统中没有 Edge 也没有 Chrome 时，才需要执行：
 >
 > ```bash
-> playwright install chromium   # 安装内置 Chromium 作为回退方案（约 290MB）
+> python -m playwright install chromium   # 安装内置 Chromium 作为回退方案（约 290MB）
 > ```
 
 ### 运行程序
