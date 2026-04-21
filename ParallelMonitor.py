@@ -165,6 +165,78 @@ def save_resource_report(url: str, timestamp: str, resources: List[dict],
         return None
 
 
+def save_round_report(results: List[dict], timestamp: str) -> Optional[str]:
+    """
+    将一轮所有站点的测试结果汇总保存为文件（JSON + CSV 双格式）
+    
+    Args:
+        results: 每个站点的结果列表，每项包含 url/dom_load/load_time/status
+        timestamp: 本轮测试的时间戳
+    
+    返回: 保存的文件路径，失败返回 None
+    
+    输出格式：
+    - JSON: monitor_reports/round_YYYYMMDD_HHMMSS.json （完整数据）
+    - CSV:  monitor_reports/round_YYYYMMDD_HHMMSS.csv  （3列简表：域名/DOM/LOAD）
+    """
+    try:
+        import json as _json
+        import csv as _csv
+
+        Path(OUTPUT_DIR).mkdir(exist_ok=True)
+
+        ts_safe = timestamp.replace(":", "-")
+        base_name = f"round_{ts_safe}"
+
+        # ---- 构建数据行（所有站点都保留） ----
+        rows = []
+        from urllib.parse import urlparse
+        for r in results:
+            hostname = urlparse(r['url']).hostname or r['url']
+            rows.append({
+                'domain': hostname,
+                'dom_ms': round(r['dom_load'], 1) if r.get('dom_load') is not None else None,
+                'load_ms': round(r['load_time'], 1) if r.get('load_time') is not None else None,
+                'status': r.get('status', 'unknown'),
+                'url': r.get('url', '')
+            })
+
+        # ---- 保存 CSV 简表（3列核心 + 状态） ----
+        csv_path = Path(OUTPUT_DIR) / f"{base_name}.csv"
+        with open(csv_path, 'w', encoding='utf-8-sig', newline='') as f:
+            writer = _csv.writer(f)
+            writer.writerow(['域名', 'DOM (ms)', 'LOAD (ms)', '状态'])
+            for row in rows:
+                dom_str = f"{row['dom_ms']:.0f}" if row['dom_ms'] is not None and row['dom_ms'] >= 0 else '--'
+                load_str = f"{row['load_ms']:.0f}" if row['load_ms'] is not None and row['load_ms'] >= 0 else '--'
+                status_cn = {
+                    'success': '✅ 正常',
+                    'timeout': '⏰ 超时',
+                    'error': '❌ 错误'
+                }.get(row['status'], row['status'])
+                writer.writerow([row['domain'], dom_str, load_str, status_cn])
+
+        # ---- 保存 JSON 完整报告 ----
+        json_path = Path(OUTPUT_DIR) / f"{base_name}.json"
+        report = {
+            'type': 'round_summary',
+            'timestamp': timestamp,
+            'total_sites': len(rows),
+            'success_count': sum(1 for r in rows if r['status'] == 'success'),
+            'error_count': sum(1 for r in rows if r['status'] != 'success'),
+            'results': rows,
+        }
+
+        with open(json_path, 'w', encoding='utf-8') as f:
+            _json.dump(report, f, ensure_ascii=False, indent=2, default=str)
+
+        return str(csv_path)
+
+    except Exception as e:
+        print(f"[轮次报告保存失败] {e}")
+        return None
+
+
 # ============================================================
 # 自定义信号类（跨线程通信）
 # ============================================================
@@ -181,6 +253,8 @@ class MonitorSignals(QObject):
     stopped = Signal()
     # 资源分析报告就绪: (url, timestamp, file_path, resource_count)
     profile_saved = Signal(str, str, str, int)
+    # 轮次汇总报告就绪: (timestamp, file_path, total_count)
+    round_report_saved = Signal(str, str, int)
 
 
 # ============================================================
@@ -201,7 +275,9 @@ class AsyncMonitorEngine:
         concurrency: int = 3,
         timeout_ms: int = 30000,
         interval_sec: int = 10,
-        enable_profiling: bool = False
+        enable_profiling: bool = False,
+        cron_expr: str = "",
+        enable_round_report: bool = False
     ):
         self.sites = sites
         self.signals = signals
@@ -209,8 +285,9 @@ class AsyncMonitorEngine:
         self.timeout_ms = timeout_ms
         self.interval_sec = interval_sec
         self.enable_profiling = enable_profiling
-
-        self._running = False
+        self.cron_expr = cron_expr.strip()  # Cron 表达式，空字符串表示间隔模式
+        self.enable_round_report = enable_round_report
+        self.sites = [self._normalize_url(u) for u in sites]
         self._playwright = None
         self._browser: Optional[Browser] = None
         self._semaphore: Optional[asyncio.Semaphore] = None
@@ -374,7 +451,7 @@ class AsyncMonitorEngine:
     async def _measure_dom_load(self, page: Page, url: str) -> tuple:
         """
         测量单个页面的 DOM Load 和完整 Load 时间
-        可选收集资源明细用于性能分析
+        支持 HTTPS → HTTP 自动降级：https 失败后尝试 http
         返回: (dom_content_load_ms, load_time_ms, status, resources_or_None)
         """
         dom_load = 0.0
@@ -382,53 +459,97 @@ class AsyncMonitorEngine:
         status = "success"
         resources = []
 
-        try:
-            # 设置超时
-            page.set_default_timeout(self.timeout_ms)
+        # 构造降级链：原始URL优先，如果是https则追加http作为回退
+        urls_to_try = [url]
+        if url.startswith('https://'):
+            fallback_url = url.replace('https://', 'http://', 1)
+            urls_to_try.append(fallback_url)
 
-            # 导航到目标页面，等待完全加载（包括资源）
-            response = await page.goto(
-                url,
-                wait_until='load',
-                timeout=self.timeout_ms
-            )
+        last_error = None
+        tried_urls = []
 
-            # 通过 JS 获取精确的 Performance Timing 数据
-            timing_data = await page.evaluate('''() => {
-                const entries = performance.getEntriesByType('navigation');
-                if (entries && entries.length > 0) {
-                    return {
-                        domContent: entries[0].domContentLoadedEventEnd || 0,
-                        load: entries[0].loadEventEnd || 0
-                    };
-                }
-                return { domContent: 0, load: 0 };
-            }''')
+        for try_url in urls_to_try:
+            tried_urls.append(try_url)
+            try:
+                # 重置状态（可能上次尝试改了值）
+                dom_load = 0.0
+                load_time = 0.0
+                status = "success"
+                resources = []
 
-            dom_load = timing_data['domContent']
-            load_time = timing_data['load']
+                page.set_default_timeout(self.timeout_ms)
 
-            # 资源分析模式：抓取所有资源
-            if self.enable_profiling:
-                resources = await self._collect_resources(page)
+                response = await page.goto(
+                    try_url,
+                    wait_until='load',
+                    timeout=self.timeout_ms
+                )
 
-            # 检查响应状态
-            if response and response.status >= 400:
+                timing_data = await page.evaluate('''() => {
+                    const entries = performance.getEntriesByType('navigation');
+                    if (entries && entries.length > 0) {
+                        return {
+                            domContent: entries[0].domContentLoadedEventEnd || 0,
+                            load: entries[0].loadEventEnd || 0
+                        };
+                    }
+                    return { domContent: 0, load: 0 };
+                }''')
+
+                dom_load = timing_data['domContent']
+                load_time = timing_data['load']
+
+                if self.enable_profiling:
+                    resources = await self._collect_resources(page)
+
+                if response and response.status >= 400:
+                    status = "error"
+                    self.signals.log_message.emit(
+                        f"⚠️ {try_url} 返回状态码: {response.status}"
+                    )
+                else:
+                    # 如果走了降级，提示一下
+                    if try_url != url:
+                        self.signals.log_message.emit(
+                            f"🔀 {url} (HTTPS失败) → 已切换 {try_url}"
+                        )
+                # 成功则跳出循环
+                break
+
+            except PWTimeoutError:
+                last_error = f"超时 ({self.timeout_ms}ms)"
+                status = "timeout"
+                dom_load = -1
+                load_time = -1
+                self.signals.log_message.emit(f"⏰ {try_url} 超时 ({self.timeout_ms}ms)")
+                continue
+
+            except Exception as e:
+                last_error = str(e)[:100]
                 status = "error"
-                self.signals.log_message.emit(f"⚠️ {url} 返回状态码: {response.status}")
+                dom_load = -1
+                load_time = -1
+                error_type = type(e).__name__
+                err_msg = str(e)[:100]
 
-        except PWTimeoutError:
-            status = "timeout"
-            dom_load = -1
-            load_time = -1
-            self.signals.log_message.emit(f"⏰ {url} 超时 ({self.timeout_ms}ms)")
+                # 判断是否值得尝试降级（连接/SSL/协议类错误才降级）
+                should_fallback = any(
+                    kw in err_msg.lower() or kw in error_type.lower()
+                    for kw in ['invalid url', 'ssl', 'tls', 'certificate',
+                               'connection', 'refused', 'reset', 'aborted',
+                               'err_name', 'net::']
+                ) or error_type in ('Error', 'PlaywrightError')
 
-        except Exception as e:
-            status = "error"
-            dom_load = -1
-            load_time = -1
-            error_type = type(e).__name__
-            self.signals.log_message.emit(f"❌ {url} 错误 [{error_type}]: {str(e)[:100]}")
+                if should_fallback and try_url != urls_to_try[-1]:
+                    self.signals.log_message.emit(
+                        f"🔄 {try_url} 失败 [{error_type}]，尝试降级..."
+                    )
+                    continue
+                else:
+                    self.signals.log_message.emit(
+                        f"❌ {try_url} 错误 [{error_type}]: {err_msg}"
+                    )
+                    break
 
         return (dom_load, load_time, status, resources if self.enable_profiling else None)
 
@@ -470,19 +591,29 @@ class AsyncMonitorEngine:
                 self.signals.record_ready.emit(url, timestamp, dom_load, load_time, status)
                 self.signals.status_update.emit(url, f"{status.upper()}")
 
-                # 资源分析：保存报告文件
-                if self.enable_profiling and status == "success" and resources:
+                # 收集本轮结果（用于汇总报告）
+                if hasattr(self, '_round_results'):
+                    self._round_results.append({
+                        'url': url,
+                        'timestamp': timestamp,
+                        'dom_load': dom_load,
+                        'load_time': load_time,
+                        'status': status,
+                    })
+
+                # 资源分析：保存报告文件（无论成败都记录）
+                if self.enable_profiling:
                     report_path = save_resource_report(
                         url=url,
                         timestamp=timestamp,
-                        resources=resources,
+                        resources=resources if (status == "success" and resources) else [],
                         dom_load=dom_load,
                         load_time=load_time,
                         status=status
                     )
                     if report_path:
                         self.signals.profile_saved.emit(
-                            url, timestamp, report_path, len(resources)
+                            url, timestamp, report_path, len(resources) if resources else 0
                         )
 
         except asyncio.CancelledError:
@@ -502,14 +633,24 @@ class AsyncMonitorEngine:
                     pass
 
     async def _monitoring_loop(self):
-        """主监控循环"""
+        """主监控循环（支持间隔模式 & Cron 定时模式）"""
         await self._init_browser()
         self._running = True
-        self.signals.log_message.emit("🚀 监控已启动")
+
+        # 根据模式显示启动信息
+        if self.cron_expr:
+            self.signals.log_message.emit(f"🚀 监控已启动 [⏰ Cron: {self.cron_expr}]")
+        else:
+            self.signals.log_message.emit("🚀 监控已启动")
 
         try:
             while self._running:
                 cycle_start = time.time()
+
+                # 初始化本轮结果收集
+                if self.enable_round_report:
+                    self._round_results = []
+                    self._round_timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
                 # 并发检测所有站点
                 tasks = [
@@ -518,15 +659,53 @@ class AsyncMonitorEngine:
                 ]
                 await asyncio.gather(*tasks, return_exceptions=True)
 
-                # 计算剩余等待时间
-                elapsed = time.time() - cycle_start
-                sleep_time = max(0.1, self.interval_sec - elapsed)
+                if not self._running:
+                    break
 
-                if self._running:
-                    self.signals.log_message.emit(
-                        f"⏱️ 本轮完成，{sleep_time:.1f}s 后开始下一轮..."
+                # ── 轮次汇总报告 ──────────────────
+                if self.enable_round_report and hasattr(self, '_round_results') and self._round_results:
+                    report_path = save_round_report(
+                        results=self._round_results,
+                        timestamp=self._round_timestamp
                     )
-                    await asyncio.sleep(sleep_time)
+                    if report_path:
+                        ok = sum(1 for r in self._round_results if r['status'] == 'success')
+                        total = len(self._round_results)
+                        self.signals.round_report_saved.emit(
+                            self._round_timestamp, report_path, total
+                        )
+                        self.signals.log_message.emit(
+                            f"📋 本轮汇总报告已保存 ({ok}/{total} 成功)"
+                        )
+
+                # ── 计算下次执行时间 ──────────────
+                if self.cron_expr:
+                    # Cron 模式：计算到下一个触发点的时间
+                    wait_sec = self._cron_next_wait()
+                    next_time_str = datetime.fromtimestamp(
+                        time.time() + wait_sec
+                    ).strftime("%Y-%m-%d %H:%M:%S")
+                    self.signals.log_message.emit(
+                        f"⏰ 本轮完成，下次执行 → {next_time_str}（等待 {self._fmt_duration(wait_sec)}）"
+                    )
+                    # 分段 sleep 以便响应停止
+                    await self._interruptible_sleep(wait_sec)
+                else:
+                    # 间隔模式
+                    elapsed = time.time() - cycle_start
+                    if elapsed >= self.interval_sec:
+                        # 本轮耗时已超过间隔 → 立即开始下一轮，不等了
+                        self.signals.log_message.emit(
+                            f"⏱️ 本轮耗时 {self._fmt_duration(elapsed)} ≥ 间隔 {self._fmt_duration(self.interval_sec)}，立即开始下一轮..."
+                        )
+                        # 不需要额外 sleep，直接进入下轮循环
+                    else:
+                        # 正常情况：等够剩余间隔时间
+                        sleep_time = self.interval_sec - elapsed
+                        self.signals.log_message.emit(
+                            f"⏱️ 本轮完成，{sleep_time:.1f}s 后开始下一轮..."
+                        )
+                        await asyncio.sleep(sleep_time)
 
         except asyncio.CancelledError:
             pass
@@ -537,6 +716,95 @@ class AsyncMonitorEngine:
             self._running = False
             self.signals.stopped.emit()
             self.signals.log_message.emit("⏹️ 监控已停止")
+
+    def _cron_next_wait(self) -> float:
+        """根据 Cron 表达式计算距离下一次执行的秒数"""
+        now = datetime.now()
+        parts = self.cron_expr.split()
+        if len(parts) != 5:
+            return self.interval_sec  # 格式错误时回退到间隔模式
+
+        minute, hour, dom, month, dow = parts
+
+        # 简单的 Cron 下次执行计算（覆盖常用场景）
+        import re as _re
+        candidates = []
+
+        # 尝试未来 366 天内找到匹配时间
+        for day_offset in range(0, 366 * 24 * 60):  # 按分钟步进，最多搜一年
+            candidate = now + __import__('datetime').timedelta(minutes=day_offset + 1)
+            if self._match_cron(candidate, minute, hour, dom, month, dow):
+                return (candidate - now).total_seconds()
+
+        # 找不到匹配（理论上不会发生），回退到默认间隔
+        return float(self.interval_sec)
+
+    @staticmethod
+    def _match_cron(dt: datetime, minute: str, hour: str, dom: str, month: str, dow: str) -> bool:
+        """检查给定时间是否匹配 Cron 表达式的各字段"""
+        import re as _re
+
+        def _match(value: int, pattern: str) -> bool:
+            """单个字段匹配"""
+            if pattern == "*":
+                return True
+            if "/" in pattern:
+                base, step = pattern.split("/")
+                step = int(step)
+                base_val = int(base) if base != "*" else 0
+                return (value - base_val) % step == 0
+            if "," in pattern:
+                return value in [int(x.strip()) for x in pattern.split(",")]
+            try:
+                return value == int(pattern)
+            except ValueError:
+                return False
+
+        if not _match(dt.minute, minute):
+            return False
+        if not _match(dt.hour, hour):
+            return False
+        if not _match(dt.day, dom):
+            return False
+        if not _match(dt.month, month):
+            return False
+        if not _match(dt.isoweekday() % 7, dow):  # Python: Mon=1..Sun=7, Cron: Sun=0..Sat=6
+            return False
+        return True
+
+    async def _interruptible_sleep(self, total_seconds: float):
+        """可中断的睡眠，每 30 秒检查一次是否需要停止"""
+        remaining = total_seconds
+        while remaining > 0 and self._running:
+            chunk = min(30.0, remaining)
+            await asyncio.sleep(chunk)
+            remaining -= chunk
+
+    @staticmethod
+    @staticmethod
+    def _normalize_url(url: str) -> str:
+        """自动为缺少协议前缀的 URL 补上 https://"""
+        url = url.strip()
+        if not url.startswith(('http://', 'https://')):
+            url = 'https://' + url
+        return url
+
+    def _fmt_duration(self, seconds: float) -> str:
+        """格式化持续时间（人类友好格式）"""
+        if seconds < 60:
+            return f"{seconds:.0f}秒"
+        elif seconds < 3600:
+            m = int(seconds // 60)
+            s = int(seconds % 60)
+            return f"{m}分{s}秒"
+        else:
+            h = int(seconds // 3600)
+            m = int((seconds % 3600) // 60)
+            if h >= 24:
+                d = h // 24
+                h = h % 24
+                return f"{d}天{h}小时{m}分"
+            return f"{h}小时{m}分"
 
 
 # ============================================================
@@ -555,7 +823,9 @@ class MonitorWorkerThread(QThread):
         concurrency: int = 3,
         timeout_ms: int = 30000,
         interval_sec: int = 10,
-        enable_profiling: bool = False
+        enable_profiling: bool = False,
+        cron_expr: str = "",
+        enable_round_report: bool = False
     ):
         super().__init__()
         self.sites = sites
@@ -564,6 +834,8 @@ class MonitorWorkerThread(QThread):
         self.timeout_ms = timeout_ms
         self.interval_sec = interval_sec
         self.enable_profiling = enable_profiling
+        self.cron_expr = cron_expr
+        self.enable_round_report = enable_round_report
 
         self._engine: Optional[AsyncMonitorEngine] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -579,7 +851,9 @@ class MonitorWorkerThread(QThread):
             concurrency=self.concurrency,
             timeout_ms=self.timeout_ms,
             interval_sec=self.interval_sec,
-            enable_profiling=self.enable_profiling
+            enable_profiling=self.enable_profiling,
+            cron_expr=self.cron_expr,
+            enable_round_report=self.enable_round_report
         )
 
         try:
@@ -1507,7 +1781,7 @@ class WebMonitorWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("🔍 网页监控工具 v1.0")
+        self.setWindowTitle("🔍 网页监控工具 v1.3")
         self.setMinimumSize(1100, 750)
 
         # 设置窗口图标（内嵌，无需外部文件）
@@ -1671,9 +1945,9 @@ class WebMonitorWindow(QMainWindow):
         control_layout.addWidget(timeout_label)
 
         self.timeout_spin = QSpinBox()
-        self.timeout_spin.setRange(1000, 120000)
+        self.timeout_spin.setRange(1000, 600000)
         self.timeout_spin.setValue(30000)
-        self.timeout_spin.setSingleStep(5000)
+        self.timeout_spin.setSingleStep(10000)
         self.timeout_spin.setSuffix(" ms")
         self.timeout_spin.setFixedWidth(100)
         control_layout.addWidget(self.timeout_spin)
@@ -1686,14 +1960,77 @@ class WebMonitorWindow(QMainWindow):
         control_layout.addWidget(interval_label)
 
         self.interval_spin = QSpinBox()
-        self.interval_spin.setRange(3, 300)
+        self.interval_spin.setRange(3, 86400)  # 最小 3s，最大 24h（86400s）
         self.interval_spin.setValue(self.DEFAULT_INTERVAL)
         self.interval_spin.setSuffix(" s")
-        self.interval_spin.setFixedWidth(80)
+        self.interval_spin.setFixedWidth(100)
+        self.interval_spin.setToolTip("检测间隔（秒），支持 3 ~ 86400（24小时）\n如需更灵活的定时调度，请使用 Cron 模式 →")
         control_layout.addWidget(self.interval_spin)
 
-        # 分隔线
+        # ── Cron 定时调度区域 ──────────────────
         from PySide6.QtWidgets import QFrame
+
+        # Cron 模式开关
+        self.cron_mode_check = QPushButton("⏰ Cron")
+        self.cron_mode_check.setCheckable(True)
+        self.cron_mode_check.setFixedWidth(70)
+        self.cron_mode_check.setMinimumHeight(32)
+        self.cron_mode_check.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.cron_mode_check.setStyleSheet("""
+            QPushButton { background: #2d2d35; color: #9ca3af; border: 1px solid #444; border-radius: 6px; font-weight: bold; }
+            QPushButton:checked { background: #2563eb; color: white; border-color: #3b82f6; }
+            QPushButton:hover { background: #3d3d45; }
+            QPushButton:checked:hover { background: #1d4ed8; }
+        """)
+        self.cron_mode_check.setToolTip("开启后使用 Cron 表达式进行定时调度\n支持：每 N 小时、每天固定时间、每周等\n适合一天一次或更长周期的场景")
+        self.cron_mode_check.toggled.connect(self._on_cron_toggled)
+        control_layout.addWidget(self.cron_mode_check)
+
+        # Cron 表达式输入（默认隐藏）
+        self.cron_edit = QLineEdit()
+        self.cron_edit.setPlaceholderText("cron 表达式，如: 0 8 * * *")
+        self.cron_edit.setFixedWidth(150)
+        self.cron_edit.setMinimumHeight(32)
+        self.cron_edit.setVisible(False)
+        self.cron_edit.setToolTip(
+            "Cron 表达式格式: 分 时 日 月 周\n"
+            "示例:\n"
+            "  0 */6 * * *   → 每 6 小时\n"
+            "  0 8 * * *     → 每天 08:00\n"
+            "  0 0 * * 1     → 每周一 00:00\n"
+            "  30 9 1 * *    → 每月 1 号 09:30"
+        )
+        control_layout.addWidget(self.cron_edit)
+
+        # Cron 预设按钮
+        cron_presets = [
+            ("每小时", "0 * * * *"),
+            ("每6h", "0 */6 * * *"),
+            ("每天", "0 8 * * *"),
+            ("每周一", "0 0 * * 1"),
+        ]
+        self.cron_preset_btns = []
+        for preset_name, preset_expr in cron_presets:
+            btn = QPushButton(preset_name)
+            btn.setFixedSize(52, 28)
+            btn.setVisible(False)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setToolTip(f"预设: {preset_expr}")
+            btn.clicked.connect(lambda checked, e=preset_expr: self._apply_cron_preset(e))
+            btn.setStyleSheet("""
+                QPushButton { background: #2a2a32; color: #b0b5c0; border: 1px solid #38383f; border-radius: 4px; font-size: 11px; }
+                QPushButton:hover { background: #36363f; color: white; }
+            """)
+            self.cron_preset_btns.append(btn)
+            control_layout.addWidget(btn)
+
+        # Cron 预览标签
+        self.cron_preview = QLabel("")
+        self.cron_preview.setStyleSheet("color: #22c55e; font-size: 11px;")
+        self.cron_preview.setVisible(False)
+        control_layout.addWidget(self.cron_preview)
+
+        # 分隔线
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.VLine)
         sep.setStyleSheet("color: #ccd0da; margin: 0 10px;")
@@ -1745,6 +2082,54 @@ class WebMonitorWindow(QMainWindow):
             }
         """)
         control_layout.addWidget(self.profile_check)
+
+        # 轮次汇总报告开关
+        round_label = QLabel("📋 汇总报告:")
+        round_label.setFont(QFont("", -1, QFont.Weight.Bold))
+        round_label.setToolTip("开启后每轮测试结束后自动生成汇总文件\n包含所有站点的 DOM/LOAD 数据（含失败项）\n输出 CSV + JSON 到 monitor_reports/ 目录")
+        control_layout.addWidget(round_label)
+
+        self.round_report_check = QPushButton("OFF")
+        self.round_report_check.setCheckable(True)
+        self.round_report_check.setFixedWidth(60)
+        self.round_report_check.setMinimumHeight(32)
+        self.round_report_check.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.round_report_check.setToolTip(
+            "开启轮次汇总报告\n"
+            "每轮测试完成后自动生成汇总文件\n"
+            "适合每天定时监控的数据收集场景\n"
+            "\n"
+            "输出内容:\n"
+            "• CSV 简表：域名 / DOM(ms) / LOAD(ms) / 状态\n"
+            "• JSON 完整报告：含统计摘要和全部数据\n"
+            "\n"
+            "无论成功或失败的站点都会被记录"
+        )
+        self.round_report_check.setStyleSheet("""
+            QPushButton {
+                background: #e5e7eb;
+                color: #374151;
+                border: 2px solid #d1d5db;
+                border-radius: 16px;
+                font-weight: bold;
+                font-size: 12px;
+                padding: 4px;
+            }
+            QPushButton:hover {
+                background: #d1d5db;
+            }
+            QPushButton:checked {
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
+                    stop:0 #10b981, stop:1 #059669);
+                color: white;
+                border-color: #10b981;
+            }
+            QPushButton:disabled {
+                background: #9ca3af;
+                color: white;
+            }
+        """)
+        control_layout.addWidget(self.round_report_check)
 
         control_layout.addStretch()
 
@@ -1853,11 +2238,24 @@ class WebMonitorWindow(QMainWindow):
         self.export_btn.clicked.connect(self._on_export)
         self.view_report_btn.clicked.connect(self._on_view_reports)
         self.profile_check.toggled.connect(self._on_profile_toggled)
+        self.round_report_check.toggled.connect(self._on_round_report_toggled)
+
+        # Cron 表达式输入时实时预览
+        self.cron_edit.textChanged.connect(self._update_cron_preview)
         self.monitor_signals.record_ready.connect(self._on_record_ready)
         self.monitor_signals.status_update.connect(self._on_status_update)
         self.monitor_signals.log_message.connect(self._append_log)
         self.monitor_signals.stopped.connect(self._on_monitor_stopped)
         self.monitor_signals.profile_saved.connect(self._on_profile_saved)
+        self.monitor_signals.round_report_saved.connect(self._on_round_report_saved)
+
+    @staticmethod
+    def _normalize_url(url: str) -> str:
+        """自动为缺少协议前缀的 URL 补上 https://"""
+        url = url.strip()
+        if not url.startswith(('http://', 'https://')):
+            url = 'https://' + url
+        return url
 
     def _load_sites(self):
         """加载站点列表"""
@@ -1867,7 +2265,7 @@ class WebMonitorWindow(QMainWindow):
             # 从文件读取
             try:
                 content = site_path.read_text(encoding='utf-8').strip()
-                self.sites = [line.strip() for line in content.split('\n') if line.strip()]
+                self.sites = [self._normalize_url(line) for line in content.split('\n') if line.strip()]
                 self._create_tabs()
                 self._append_log(f"📄 已从 {self.SITE_FILE} 加载 {len(self.sites)} 个网站")
             except Exception as e:
@@ -1920,13 +2318,37 @@ class WebMonitorWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "没有可监控的网站！\n请在 site.txt 中添加URL后重启。")
             return
 
+        # Cron 模式校验
+        cron_expr = ""
+        if self.cron_mode_check.isChecked():
+            cron_expr = self.cron_edit.text().strip()
+            parts = cron_expr.split()
+            if len(parts) != 5:
+                QMessageBox.warning(self, "Cron 格式错误",
+                    f"Cron 表达式格式不正确（需要 5 个字段: 分 时 日 月 周）\n当前: '{cron_expr}'\n\n示例: 0 8 * * * （每天8点）")
+                return
+
+        # 超时时间 vs 间隔时间合理性检查
+        timeout_ms = self.timeout_spin.value()
+        interval_sec = self.interval_spin.value() if not self.cron_mode_check.isChecked() else None
+        if interval_sec and (timeout_ms / 1000) > interval_sec:
+            self._append_log(
+                f"⚠️ 超时({timeout_ms / 1000:.0f}s) > 间隔({interval_sec}s)，"
+                f"每轮可能连续执行不等待，建议调大间隔或减小超时"
+            )
+
         # 禁用/启用控件
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.concurrency_spin.setEnabled(False)
         self.timeout_spin.setEnabled(False)
         self.interval_spin.setEnabled(False)
-        self.profile_check.setEnabled(False)  # 运行中锁定开关
+        self.profile_check.setEnabled(False)   # 运行中锁定开关
+        self.round_report_check.setEnabled(False)  # 运行中锁定开关
+        self.cron_mode_check.setEnabled(False)  # 运行中锁定 Cron 开关
+        self.cron_edit.setEnabled(False)
+        for btn in self.cron_preset_btns:
+            btn.setEnabled(False)
 
         # 启动工作线程
         self.worker_thread = MonitorWorkerThread(
@@ -1935,13 +2357,17 @@ class WebMonitorWindow(QMainWindow):
             concurrency=self.concurrency_spin.value(),
             timeout_ms=self.timeout_spin.value(),
             interval_sec=self.interval_spin.value(),
-            enable_profiling=self.profile_check.isChecked()
+            enable_profiling=self.profile_check.isChecked(),
+            cron_expr=cron_expr,
+            enable_round_report=self.round_report_check.isChecked()
         )
         self.worker_thread.finished.connect(self._on_thread_finished)
         self.worker_thread.start()
 
         profiling_status = "🔍 已开启" if self.profile_check.isChecked() else ""
-        self._append_log(f"🎬 正在启动监控... {profiling_status}")
+        round_status = "📋 汇总已开启" if self.round_report_check.isChecked() else ""
+        extra = " ".join(filter(None, [profiling_status, round_status]))
+        self._append_log(f"🎬 正在启动监控... {extra}")
 
     def _on_stop(self):
         """点击停止按钮"""
@@ -1954,8 +2380,17 @@ class WebMonitorWindow(QMainWindow):
         self.stop_btn.setEnabled(False)
         self.concurrency_spin.setEnabled(True)    # 停止后恢复可调
         self.timeout_spin.setEnabled(True)         # 停止后恢复可调
-        self.interval_spin.setEnabled(True)        # 停止后恢复可调
         self.profile_check.setEnabled(True)        # 停止后恢复可调
+        self.round_report_check.setEnabled(True)    # 停止后恢复可调
+        self.cron_mode_check.setEnabled(True)      # 恢复 Cron 开关
+        self.cron_edit.setEnabled(True)            # 恢复编辑
+
+        # 间隔时间根据 Cron 状态决定是否恢复
+        if not self.cron_mode_check.isChecked():
+            self.interval_spin.setEnabled(True)
+
+        for btn in self.cron_preset_btns:
+            btn.setEnabled(True)
 
     def _on_record_ready(self, url: str, timestamp: str, dom_load: float, load_time: float, status: str):
         """收到新记录信号"""
@@ -1987,8 +2422,14 @@ class WebMonitorWindow(QMainWindow):
         self.stop_btn.setEnabled(False)
         self.concurrency_spin.setEnabled(True)
         self.timeout_spin.setEnabled(True)
-        self.interval_spin.setEnabled(True)
         self.profile_check.setEnabled(True)
+        self.round_report_check.setEnabled(True)
+        self.cron_mode_check.setEnabled(True)
+        self.cron_edit.setEnabled(True)
+        if not self.cron_mode_check.isChecked():
+            self.interval_spin.setEnabled(True)
+        for btn in self.cron_preset_btns:
+            btn.setEnabled(True)
         self._append_log("✅ 监控已完全停止")
 
     def _on_thread_finished(self):
@@ -1997,8 +2438,14 @@ class WebMonitorWindow(QMainWindow):
         self.stop_btn.setEnabled(False)
         self.concurrency_spin.setEnabled(True)
         self.timeout_spin.setEnabled(True)
-        self.interval_spin.setEnabled(True)
         self.profile_check.setEnabled(True)
+        self.round_report_check.setEnabled(True)
+        self.cron_mode_check.setEnabled(True)
+        self.cron_edit.setEnabled(True)
+        if not self.cron_mode_check.isChecked():
+            self.interval_spin.setEnabled(True)
+        for btn in self.cron_preset_btns:
+            btn.setEnabled(True)
 
     def _on_profile_toggled(self, checked: bool):
         """资源分析开关切换"""
@@ -2008,6 +2455,99 @@ class WebMonitorWindow(QMainWindow):
         else:
             self.profile_check.setText("OFF")
             self._append_log("🔍 资源分析已关闭")
+
+    def _on_round_report_toggled(self, checked: bool):
+        """轮次汇总报告开关切换"""
+        if checked:
+            self.round_report_check.setText("ON")
+            self._append_log("📋 汇总报告已开启 - 每轮测试后自动保存到 monitor_reports/")
+        else:
+            self.round_report_check.setText("OFF")
+            self._append_log("📋 汇总报告已关闭")
+
+    def _on_round_report_saved(self, timestamp: str, file_path: str, total_count: int):
+        """轮次汇总报告保存完成"""
+        self._append_log(f"📋 汇总已导出 → {Path(file_path).name} ({total_count} 个站点)")
+
+    # ── Cron 定时调度相关方法 ──────────────────
+
+    def _on_cron_toggled(self, checked: bool):
+        """Cron 模式开关切换"""
+        self.cron_edit.setVisible(checked)
+        for btn in self.cron_preset_btns:
+            btn.setVisible(checked)
+        self.cron_preview.setVisible(checked)
+        if checked:
+            # 开启 Cron 模式 → 隐藏间隔时间（Cron 自己决定间隔）
+            self.interval_spin.setEnabled(False)
+            self.interval_spin.setToolTip("已由 Cron 调度接管")
+            self._update_cron_preview()
+            self._append_log("⏰ Cron 定时模式已开启")
+        else:
+            self.interval_spin.setEnabled(True)
+            self.interval_spin.setToolTip("检测间隔（秒），支持 3 ~ 86400（24小时）\n如需更灵活的定时调度，请使用 Cron 模式 →")
+            self.cron_preview.setText("")
+
+    def _apply_cron_preset(self, expr: str):
+        """应用预设的 Cron 表达式"""
+        self.cron_edit.setText(expr)
+        self._update_cron_preview()
+
+    def _update_cron_preview(self):
+        """更新 Cron 表达式的自然语言预览"""
+        expr = self.cron_edit.text().strip()
+        preview = self._cron_to_human(expr)
+        self.cron_preview.setText(f"📌 {preview}")
+        # 根据是否有效改变颜色
+        if expr and len(expr.split()) == 5:
+            self.cron_preview.setStyleSheet("color: #22c55e; font-size: 11px;")
+        else:
+            self.cron_preview.setStyleSheet("color: #f59e0b; font-size: 11px;")
+
+    @staticmethod
+    def _cron_to_human(expr: str) -> str:
+        """将 Cron 表达式翻译成中文自然语言描述"""
+        expr = expr.strip()
+        if not expr:
+            return "单次运行（不重复）"
+        parts = expr.strip().split()
+        if len(parts) != 5:
+            return f"自定义表达式: {expr}"
+
+        minute, hour, dom, month, dow = parts
+
+        # 每 N 分钟
+        m = __import__('re').match(r'^\*/(\d+)$', minute)
+        if m and hour == "*" and dom == "*" and month == "*" and dow == "*":
+            n = int(m.group(1))
+            return f"每隔 {n} 分钟执行一次"
+
+        # 每小时第 N 分
+        m = __import__('re').match(r'^(\d+)$', minute)
+        if m and hour == "*" and dom == "*" and month == "*" and dow == "*":
+            return f"每小时第 {m.group(1)} 分钟"
+
+        # 每天 H:M
+        mm = __import__('re').match(r'^(\d+)$', minute)
+        hm = __import__('re').match(r'^(\d+)$', hour)
+        if mm and hm and dom == "*" and month == "*" and dow == "*":
+            return f"每天 {hm.group(1)}:{int(mm.group(1)):02d}"
+
+        # 每隔 N 小时
+        if minute == "0":
+            hm2 = __import__('re').match(r'^\*/(\d+)$', hour)
+            if hm2 and dom == "*" and month == "*" and dow == "*":
+                return f"每隔 {hm2.group(1)} 小时"
+
+        # 每周几 H:M
+        mm = __import__('re').match(r'^(\d+)$', minute)
+        hm = __import__('re').match(r'^(\d+)$', hour)
+        dm = __import__('re').match(r'^(\d)$', dow)
+        DOW_CN = {"0": "周日", "1": "周一", "2": "周二", "3": "周三", "4": "周四", "5": "周五", "6": "周六", "7": "周日"}
+        if mm and hm and dm and dom == "*" and month == "*":
+            return f"每{DOW_CN.get(dm.group(1), '周' + dm.group(1))} {hm.group(1)}:{int(mm.group(1)):02d}"
+
+        return f"自定义计划: {expr}"
 
     def _on_profile_saved(self, url: str, timestamp: str, file_path: str, resource_count: int):
         """资源报告保存完成"""
@@ -2058,9 +2598,7 @@ class WebMonitorWindow(QMainWindow):
                 writer = csv.writer(csvfile)
 
                 for url, tab in self.site_tabs.items():
-                    if not tab.records:
-                        continue
-
+                    # 所有站点都保留，即使没有记录或只有失败记录
                     from urllib.parse import urlparse
                     hostname = urlparse(url).hostname or url[:30]
 
@@ -2071,11 +2609,14 @@ class WebMonitorWindow(QMainWindow):
                     # 写表头（4列）
                     writer.writerow(["时间 (Time)", "DOM Content (ms)", "Load (ms)", "状态 (Status)"])
 
-                    # 写数据行
-                    for record in tab.records:
-                        dom_str = f"{record.dom_load:.0f}" if record.dom_load >= 0 else "--"
-                        load_str = f"{record.load_time:.0f}" if record.load_time >= 0 else "--"
-                        writer.writerow([record.timestamp, dom_str, load_str, record.status.upper()])
+                    # 写数据行（所有记录，含失败/超时）
+                    if tab.records:
+                        for record in tab.records:
+                            dom_str = f"{record.dom_load:.0f}" if record.dom_load >= 0 else "--"
+                            load_str = f"{record.load_time:.0f}" if record.load_time >= 0 else "--"
+                            writer.writerow([record.timestamp, dom_str, load_str, record.status.upper()])
+                    else:
+                        writer.writerow(["(暂无监控记录)", "--", "--", "--"])
 
                     # 统计摘要（双指标）
                     success_records = [r for r in tab.records if r.status == "success" and r.dom_load > 0]
@@ -2100,7 +2641,7 @@ class WebMonitorWindow(QMainWindow):
                 f"✅ 已成功导出！\n\n"
                 f"📁 文件：{file_path}\n"
                 f"📊 记录数：{total_records} 条\n"
-                f"🌐 站点数：{sum(1 for t in self.site_tabs.values() if t.records)} 个有数据的站点"
+                f"🌐 站点数：{len(self.site_tabs)} 个（含失败/无数据站点）"
             )
 
         except Exception as e:
