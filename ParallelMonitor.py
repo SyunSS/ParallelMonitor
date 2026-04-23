@@ -1779,7 +1779,7 @@ class WebMonitorWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("🔍 网页监控工具 v1.3")
+        self.setWindowTitle("🔍 网页监控工具 v1.4")
         self.setMinimumSize(1100, 750)
 
         # 设置窗口图标（内嵌，无需外部文件）
