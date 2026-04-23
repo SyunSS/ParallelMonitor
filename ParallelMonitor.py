@@ -880,8 +880,8 @@ class MonitorWorkerThread(QThread):
 class SiteTab(QWidget):
     """单个网站的监控 Tab 页面 - 支持双指标（DOM Load + 完整 Load）"""
 
-    MAX_TABLE_ROWS = 200  # 表格最多保留行数
-    CHART_MAX_POINTS = 50  # 图表最多显示数据点数
+    MAX_TABLE_ROWS = 10000  # 表格最多保留行数（UI显示限制，内存记录不截断）
+    CHART_MAX_POINTS = 50   # 图表最多显示数据点数
 
     def __init__(self, url: str, parent=None):
         super().__init__(parent)
@@ -1036,10 +1036,8 @@ class SiteTab(QWidget):
 
     def add_record(self, record: MonitorRecord):
         """添加新的监控记录并更新 UI"""
+        # 内存记录永久保留（用于导出），不做截断
         self.records.append(record)
-
-        if len(self.records) > self.MAX_TABLE_ROWS:
-            self.records = self.records[-self.MAX_TABLE_ROWS:]
 
         # 状态颜色
         if record.status == "success":
