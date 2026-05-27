@@ -13,6 +13,7 @@
 import asyncio
 import base64
 import csv
+import socket
 import subprocess
 import sys
 import os
@@ -258,6 +259,248 @@ class MonitorSignals(QObject):
 
 
 # ============================================================
+# DNS 预设和本地代理
+# ============================================================
+
+DNS_PRESETS = {
+    "alidns": {
+        "name": "AliDNS",
+        "udp": "223.5.5.5",
+        "doh": "https://dns.alidns.com/dns-query"
+    },
+    "google": {
+        "name": "Google",
+        "udp": "8.8.8.8",
+        "doh": "https://dns.google/dns-query"
+    },
+    "cloudflare": {
+        "name": "Cloudflare",
+        "udp": "1.1.1.1",
+        "doh": "https://cloudflare-dns.com/dns-query"
+    },
+}
+
+
+class DnsProxyProtocol(asyncio.DatagramProtocol):
+    """UDP DNS 协议处理 - 接收本地 DNS 请求并异步转发"""
+
+    def __init__(self, handler):
+        self.transport = None
+        self._handler = handler
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def datagram_received(self, data: bytes, addr):
+        asyncio.ensure_future(self._handle(data, addr))
+
+    async def _handle(self, data: bytes, addr):
+        from urllib.parse import urlparse
+        import dns.message
+        try:
+            resp_data = await self._handler(data)
+            self.transport.sendto(resp_data, addr)
+        except Exception:
+            pass
+
+
+class DnsProxy:
+    """
+    本地 DNS 代理
+    启动一个本地 UDP DNS 服务器（127.0.0.1:15353），
+    将收到的 DNS 查询转发到上游（UDP 53 或 DOH HTTPS）。
+    自动修改系统 DNS 指向本地代理。
+    """
+
+    LISTEN_PORT = 15353
+
+    def __init__(self, protocol: str = "udp", upstream: str = "223.5.5.5"):
+        self.protocol = protocol  # "udp" | "doh"
+        self.upstream = upstream
+        self._transport = None
+        self._saved_dns: List[tuple] = []
+        self._active = False
+
+    @property
+    def is_active(self) -> bool:
+        return self._active
+
+    @staticmethod
+    def check_admin() -> bool:
+        """检测当前是否有管理员权限"""
+        try:
+            import ctypes
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            return False
+
+    async def start(self):
+        """启动 DNS 代理并修改系统 DNS"""
+        if self._active:
+            return
+        if self.protocol not in ("udp", "doh"):
+            return
+
+        if not self.check_admin():
+            raise PermissionError(
+                "修改系统 DNS 需要管理员权限！\n"
+                "请以管理员身份运行此程序（右键 → 以管理员身份运行）。"
+            )
+
+        self._saved_dns = self._detect_current_dns()
+        if not self._saved_dns:
+            raise RuntimeError("无法检测当前系统 DNS 配置")
+
+        loop = asyncio.get_event_loop()
+        try:
+            self._transport, _ = await loop.create_datagram_endpoint(
+                lambda: DnsProxyProtocol(self._handle_query),
+                local_addr=('127.0.0.1', self.LISTEN_PORT)
+            )
+        except OSError as e:
+            raise RuntimeError(f"DNS 代理端口 {self.LISTEN_PORT} 被占用: {e}")
+
+        self._set_system_dns("127.0.0.1")
+        self._active = True
+
+    async def stop(self):
+        """停止 DNS 代理并恢复系统 DNS"""
+        if not self._active:
+            return
+        if self._transport:
+            self._transport.close()
+            self._transport = None
+        self._restore_system_dns()
+        self._active = False
+
+    async def _handle_query(self, data: bytes) -> bytes:
+        """处理单个 DNS 查询，转发到上游并返回响应"""
+        import dns.message
+        import dns.asyncquery
+        import dns.exception
+        try:
+            query = dns.message.from_wire(data)
+            if self.protocol == "udp":
+                resp = await dns.asyncquery.udp(query, self.upstream, port=53, timeout=5)
+            else:
+                resp = await dns.asyncquery.https(query, self.upstream, timeout=5)
+            return resp.to_wire()
+        except dns.exception.DNSException:
+            return b""
+        except Exception:
+            return data
+
+    # ── 平台相关的 DNS 操作 ──────────────────────────
+
+    @staticmethod
+    def _get_default_interface_ip() -> str:
+        """获取默认路由接口的 IP 地址"""
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(3)
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+            s.close()
+            return local_ip
+        except Exception:
+            return ""
+
+    def _filter_default_interface(self, interfaces: List[tuple]) -> List[tuple]:
+        """只保留包含默认路由 IP 的接口"""
+        local_ip = self._get_default_interface_ip()
+        if not local_ip or not interfaces:
+            return interfaces[:1] if interfaces else []
+
+        import re
+        for iface, _ in interfaces:
+            try:
+                r = subprocess.run(
+                    ['netsh', 'interface', 'ip', 'show', 'addresses', f'name={iface}'],
+                    capture_output=True, text=True, timeout=10,
+                    encoding='utf-8', errors='replace'
+                )
+                if local_ip in r.stdout:
+                    return [(iface, [s for i, s in interfaces if i == iface][0] if len(interfaces) > 1 else interfaces[0][1])]
+            except Exception:
+                pass
+        return interfaces[:1]
+
+    def _detect_current_dns(self) -> Optional[List[tuple]]:
+        """检测当前系统 DNS，只返回默认路由接口"""
+        try:
+            all_ifaces = self._detect_dns_windows()
+            return self._filter_default_interface(all_ifaces)
+        except Exception:
+            pass
+        return None
+
+    def _detect_dns_windows(self) -> List[tuple]:
+        import re
+        result = subprocess.run(
+            ['netsh', 'interface', 'ip', 'show', 'dns'],
+            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10
+        )
+        interfaces: Dict[str, list] = {}
+        current_iface = None
+        ip_pattern = re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b')
+        quote_pattern = re.compile(r'"([^"]+)"')
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            m = quote_pattern.search(line)
+            if m:
+                current_iface = m.group(1)
+                if current_iface not in interfaces:
+                    interfaces[current_iface] = []
+            ips = ip_pattern.findall(line)
+            if ips and current_iface:
+                for ip in ips:
+                    if ip not in interfaces[current_iface]:
+                        interfaces[current_iface].append(ip)
+        return list(interfaces.items())
+
+
+
+    def _set_system_dns(self, dns_ip: str):
+        """设置系统 DNS 为指定 IP（仅默认路由接口）"""
+        try:
+            for iface, _ in self._saved_dns:
+                subprocess.run(
+                    ['netsh', 'interface', 'ipv4', 'set', 'dns',
+                     f'name={iface}', 'static', dns_ip, 'validate=no'],
+                    capture_output=True, timeout=10
+                )
+        except Exception as e:
+            print(f"[DNS] 设置系统 DNS 失败: {e}")
+
+    def _restore_system_dns(self):
+        """恢复系统 DNS 到原始值（仅默认路由接口）"""
+        if not self._saved_dns:
+            return
+        try:
+            for iface, servers in self._saved_dns:
+                if servers:
+                    subprocess.run(
+                        ['netsh', 'interface', 'ipv4', 'set', 'dns',
+                         f'name={iface}', 'static', servers[0], 'validate=no'],
+                        capture_output=True, timeout=10
+                    )
+                    for s in servers[1:]:
+                        subprocess.run(
+                            ['netsh', 'interface', 'ipv4', 'add', 'dns',
+                             f'name={iface}', s, 'index=2', 'validate=no'],
+                            capture_output=True, timeout=10
+                        )
+                else:
+                    subprocess.run(
+                        ['netsh', 'interface', 'ipv4', 'set', 'dns',
+                         f'name={iface}', 'dhcp'],
+                        capture_output=True, timeout=10
+                    )
+        except Exception as e:
+            print(f"[DNS] 恢复系统 DNS 失败: {e}")
+
+
+# ============================================================
 # 异步监控引擎（在独立线程中运行）
 # ============================================================
 
@@ -277,7 +520,9 @@ class AsyncMonitorEngine:
         interval_sec: int = 10,
         enable_profiling: bool = False,
         cron_expr: str = "",
-        enable_round_report: bool = False
+        enable_round_report: bool = False,
+        dns_protocol: str = "",
+        dns_upstream: str = "",
     ):
         self.sites = sites
         self.signals = signals
@@ -285,12 +530,16 @@ class AsyncMonitorEngine:
         self.timeout_ms = timeout_ms
         self.interval_sec = interval_sec
         self.enable_profiling = enable_profiling
-        self.cron_expr = cron_expr.strip()  # Cron 表达式，空字符串表示间隔模式
+        self.cron_expr = cron_expr.strip()
         self.enable_round_report = enable_round_report
         self.sites = [self._normalize_url(u) for u in sites]
         self._playwright = None
         self._browser: Optional[Browser] = None
         self._semaphore: Optional[asyncio.Semaphore] = None
+        self._running = False
+        self._dns_proxy: Optional[DnsProxy] = None
+        if dns_protocol:
+            self._dns_proxy = DnsProxy(protocol=dns_protocol, upstream=dns_upstream)
 
     @property
     def is_running(self) -> bool:
@@ -302,6 +551,15 @@ class AsyncMonitorEngine:
 
     async def _init_browser(self):
         """初始化浏览器实例（优先使用系统浏览器，回退到Playwright自带）"""
+        if self._dns_proxy:
+            try:
+                await self._dns_proxy.start()
+                self.signals.log_message.emit(
+                    f"🌐 DNS 代理已启动 [{self._dns_proxy.protocol.upper()}] → {self._dns_proxy.upstream}"
+                )
+            except Exception as e:
+                self.signals.log_message.emit(f"⚠️ DNS 代理启动失败: {e}")
+
         if self._browser is None:
             mode_msg = " + 🔍 资源分析已开启" if self.enable_profiling else ""
             self._playwright = await async_playwright().start()
@@ -363,16 +621,23 @@ class AsyncMonitorEngine:
         if self._browser:
             try:
                 await self._browser.close()
-            except Exception:
+            except BaseException:
                 pass
             self._browser = None
         if self._playwright:
             try:
                 await self._playwright.stop()
-            except Exception:
+            except BaseException:
                 pass
             self._playwright = None
         self.signals.log_message.emit("🔌 浏览器已关闭")
+
+        if self._dns_proxy and self._dns_proxy.is_active:
+            try:
+                await self._dns_proxy.stop()
+                self.signals.log_message.emit("🌐 DNS 代理已停止，系统 DNS 已恢复")
+            except Exception as e:
+                self.signals.log_message.emit(f"⚠️ DNS 代理停止失败: {e}")
 
     async def _collect_resources(self, page: Page) -> list:
         """
@@ -712,7 +977,10 @@ class AsyncMonitorEngine:
         except Exception as e:
             self.signals.log_message.emit(f"💥 监控循环异常: {str(e)}")
         finally:
-            await self._close_browser()
+            try:
+                await self._close_browser()
+            except BaseException:
+                pass
             self._running = False
             self.signals.stopped.emit()
             self.signals.log_message.emit("⏹️ 监控已停止")
@@ -727,7 +995,6 @@ class AsyncMonitorEngine:
         minute, hour, dom, month, dow = parts
 
         # 简单的 Cron 下次执行计算（覆盖常用场景）
-        import re as _re
         candidates = []
 
         # 尝试未来 366 天内找到匹配时间
@@ -773,14 +1040,13 @@ class AsyncMonitorEngine:
         return True
 
     async def _interruptible_sleep(self, total_seconds: float):
-        """可中断的睡眠，每 30 秒检查一次是否需要停止"""
+        """可中断的睡眠，每 1 秒检查一次是否需要停止"""
         remaining = total_seconds
         while remaining > 0 and self._running:
-            chunk = min(30.0, remaining)
+            chunk = min(1.0, remaining)
             await asyncio.sleep(chunk)
             remaining -= chunk
 
-    @staticmethod
     @staticmethod
     def _normalize_url(url: str) -> str:
         """自动为缺少协议前缀的 URL 补上 https://"""
@@ -825,7 +1091,9 @@ class MonitorWorkerThread(QThread):
         interval_sec: int = 10,
         enable_profiling: bool = False,
         cron_expr: str = "",
-        enable_round_report: bool = False
+        enable_round_report: bool = False,
+        dns_protocol: str = "",
+        dns_upstream: str = "",
     ):
         super().__init__()
         self.sites = sites
@@ -836,6 +1104,8 @@ class MonitorWorkerThread(QThread):
         self.enable_profiling = enable_profiling
         self.cron_expr = cron_expr
         self.enable_round_report = enable_round_report
+        self.dns_protocol = dns_protocol
+        self.dns_upstream = dns_upstream
 
         self._engine: Optional[AsyncMonitorEngine] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -853,11 +1123,15 @@ class MonitorWorkerThread(QThread):
             interval_sec=self.interval_sec,
             enable_profiling=self.enable_profiling,
             cron_expr=self.cron_expr,
-            enable_round_report=self.enable_round_report
+            enable_round_report=self.enable_round_report,
+            dns_protocol=self.dns_protocol,
+            dns_upstream=self.dns_upstream,
         )
 
         try:
             self._loop.run_until_complete(self._engine._monitoring_loop())
+        except asyncio.CancelledError:
+            pass
         except Exception as e:
             self.signals.log_message.emit(f"线程异常退出: {e}")
         finally:
@@ -865,12 +1139,11 @@ class MonitorWorkerThread(QThread):
 
     def stop(self):
         """请求停止监控"""
-        if self._engine and self._engine.is_running:
+        if self._engine:
             self._engine.stop()
-            # 安排一个协程来取消所有任务，加速停止
+            # 唤醒事件循环，使其能立即响应 _running = False
             if self._loop and self._loop.is_running():
-                for task in asyncio.all_tasks(self._loop):
-                    task.cancel()
+                self._loop.call_soon_threadsafe(lambda: None)
 
 
 # ============================================================
@@ -1113,7 +1386,7 @@ class SiteTab(QWidget):
                        if r.status == "success" and r.dom_load >= 0]
         success_load = [(i, r.load_time) for i, r in enumerate(recent)
                         if r.status == "success" and r.load_time >= 0]
-        fail_data = [i for i, r in enumerate(recent) if r.status != "success"]
+        fail_data = [(i, r) for i, r in enumerate(recent) if r.status != "success"]
 
         # DCL 曲线
         if success_dcl:
@@ -1129,26 +1402,19 @@ class SiteTab(QWidget):
         else:
             self.curve_load.setData([], [])
 
-        # 异常散点
+        # 异常散点 - 使用各自记录的 dom_load 作为 Y 值
         if fail_data:
-            last_good_y = success_dcl[-1][1] if success_dcl else 0
-            self.scatter.setData(fail_data, [last_good_y] * len(fail_data))
+            fx, fy = zip(*[(i, r.dom_load if r.dom_load >= 0 else 0) for i, r in fail_data])
+            self.scatter.setData(list(fx), list(fy))
         else:
             self.scatter.setData([], [])
 
-        # Y轴自动范围
+        # Y轴自动范围（同时考虑 dom_load + load_time）
         all_valid = [r.dom_load for r in recent if r.dom_load > 0] + \
                     [r.load_time for r in recent if r.load_time > 0]
         if all_valid:
             ymin = min(all_valid) * 0.7
             ymax = max(all_valid) * 1.25
-            self.plot_widget.setYRange(ymin, ymax)
-
-        # 自动调整Y轴范围
-        valid_values = [r.dom_load for r in self.records[-self.CHART_MAX_POINTS:] if r.dom_load > 0]
-        if valid_values:
-            ymin = min(valid_values) * 0.8
-            ymax = max(valid_values) * 1.2
             self.plot_widget.setYRange(ymin, ymax)
 
 
@@ -1501,12 +1767,7 @@ class ReportViewerDialog(QDialog):
     def _open_report_dir(self):
         """打开报告目录（monitor_reports/）"""
         path = Path(OUTPUT_DIR).resolve()
-        if sys.platform == 'win32':
-            os.startfile(str(path))
-        elif sys.platform == 'darwin':
-            subprocess.run(['open', str(path)])
-        else:
-            subprocess.run(['xdg-open', str(path)])
+        os.startfile(str(path))
 
     def load_report(self, filepath: str):
         """加载并解析一个 JSON 报告文件"""
@@ -1639,7 +1900,10 @@ class ReportViewerDialog(QDialog):
             QApplication.clipboard().setText(text)
             col_header = self.resource_table.horizontalHeaderItem(item.column())
             col_name = col_header.text() if col_header else f"列{item.column()}"
-            self.statusTip(f"✅ 已复制 [{col_name}]: {text[:40]}{'...' if len(text) > 40 else ''}")
+            self.setWindowTitle(
+                f"📊 资源分析面板 — ✅ 已复制 [{col_name}]: "
+                f"{text[:40]}{'...' if len(text) > 40 else ''}"
+            )
 
     # ========== 筛选 ==========
 
@@ -1779,7 +2043,7 @@ class WebMonitorWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("🔍 网页监控工具 v1.4")
+        self.setWindowTitle("🔍 网页监控工具 v1.5")
         self.setMinimumSize(1100, 750)
 
         # 设置窗口图标（内嵌，无需外部文件）
@@ -1808,199 +2072,191 @@ class WebMonitorWindow(QMainWindow):
         main_layout.setSpacing(12)
 
         # ======== 顶部控制区 ========
+        # 主控制面板（只显示核心控件）
         control_group = QGroupBox("控制面板")
-        control_layout = QHBoxLayout(control_group)
 
-        # Start / Stop 按钮
+        # 使用 QVBoxLayout：第1行核心控件，第2行高级设置
+        main_ctl_layout = QVBoxLayout(control_group)
+        main_ctl_layout.setSpacing(6)
+
+        # ── 第1行：核心控件 ──────────────────
+        row1 = QHBoxLayout()
+
+        btn_style = """
+            QPushButton {
+                color: white; border: none; border-radius: 8px;
+                padding: 8px 20px; font-size: 13px; font-weight: bold;
+                min-width: 100px;
+            }
+            QPushButton:disabled { background: #9ca3af; }
+        """
+
         self.start_btn = QPushButton("▶ 开始监控")
         self.start_btn.setMinimumHeight(38)
         self.start_btn.setFont(QFont("", 10, QFont.Weight.Bold))
         self.start_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.start_btn.setStyleSheet("""
+        self.start_btn.setStyleSheet(
+            btn_style + """
             QPushButton {
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
                     stop:0 #22c55e, stop:1 #16a34a);
-                color: white;
-                border: none;
-                border-radius: 8px;
-                padding: 8px 24px;
-                font-size: 13px;
             }
-            QPushButton:hover {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #16a34a, stop:1 #15803d);
-            }
-            QPushButton:pressed {
-                background: #15803d;
-            }
-            QPushButton:disabled {
-                background: #9ca3af;
-            }
+            QPushButton:hover { background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                stop:0 #16a34a, stop:1 #15803d); }
+            QPushButton:pressed { background: #15803d; }
         """)
-        control_layout.addWidget(self.start_btn)
+        row1.addWidget(self.start_btn)
 
         self.stop_btn = QPushButton("⏹ 停止监控")
         self.stop_btn.setMinimumHeight(38)
         self.stop_btn.setEnabled(False)
         self.stop_btn.setFont(QFont("", 10, QFont.Weight.Bold))
         self.stop_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.stop_btn.setStyleSheet("""
+        self.stop_btn.setStyleSheet(
+            btn_style + """
             QPushButton {
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
                     stop:0 #ef4444, stop:1 #dc2626);
-                color: white;
-                border: none;
-                border-radius: 8px;
-                padding: 8px 24px;
-                font-size: 13px;
             }
-            QPushButton:hover {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #dc2626, stop:1 #b91c1c);
-            }
-            QPushButton:pressed {
-                background: #b91c1c;
-            }
-            QPushButton:disabled {
-                background: #9ca3af;
-            }
+            QPushButton:hover { background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                stop:0 #dc2626, stop:1 #b91c1c); }
+            QPushButton:pressed { background: #b91c1c; }
         """)
-        control_layout.addWidget(self.stop_btn)
+        row1.addWidget(self.stop_btn)
 
-        # 导出数据按钮
         self.export_btn = QPushButton("📥 导出数据")
         self.export_btn.setMinimumHeight(38)
         self.export_btn.setFont(QFont("", 10, QFont.Weight.Bold))
         self.export_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.export_btn.setStyleSheet("""
+        self.export_btn.setStyleSheet(
+            btn_style + """
             QPushButton {
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
                     stop:0 #3b82f6, stop:1 #2563eb);
-                color: white;
-                border: none;
-                border-radius: 8px;
-                padding: 8px 24px;
-                font-size: 13px;
             }
-            QPushButton:hover {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #2563eb, stop:1 #1d4ed8);
-            }
-            QPushButton:pressed {
-                background: #1d4ed8;
-            }
+            QPushButton:hover { background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                stop:0 #2563eb, stop:1 #1d4ed8); }
+            QPushButton:pressed { background: #1d4ed8; }
         """)
-        control_layout.addWidget(self.export_btn)
+        row1.addWidget(self.export_btn)
 
-        # 查看报告按钮
         self.view_report_btn = QPushButton("📊 查看报告")
         self.view_report_btn.setMinimumHeight(38)
         self.view_report_btn.setFont(QFont("", 10, QFont.Weight.Bold))
         self.view_report_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.view_report_btn.setToolTip(
-            "打开资源分析面板\n"
-            "查看已收集的资源明细报告\n"
-            "支持：排序 / 筛选 / 图表联动"
+            "打开资源分析面板\n查看已收集的资源明细报告\n支持：排序 / 筛选 / 图表联动"
         )
-        self.view_report_btn.setStyleSheet("""
+        self.view_report_btn.setStyleSheet(
+            btn_style + """
             QPushButton {
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
                     stop:0 #8b5cf6, stop:1 #7c3aed);
-                color: white;
-                border: none;
-                border-radius: 8px;
-                padding: 8px 24px;
-                font-size: 13px;
             }
-            QPushButton:hover {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #7c3aed, stop:1 #6d28d9);
-            }
-            QPushButton:pressed {
-                background: #6d28d9;
-            }
+            QPushButton:hover { background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                stop:0 #7c3aed, stop:1 #6d28d9); }
+            QPushButton:pressed { background: #6d28d9; }
         """)
-        control_layout.addWidget(self.view_report_btn)
+        row1.addWidget(self.view_report_btn)
 
-        control_layout.addSpacing(20)
+        row1.addSpacing(12)
 
         # 并发数设置
-        conc_label = QLabel("并发数:")
+        conc_label = QLabel("并发:")
         conc_label.setFont(QFont("", -1, QFont.Weight.Bold))
-        control_layout.addWidget(conc_label)
+        row1.addWidget(conc_label)
 
         self.concurrency_spin = QSpinBox()
         self.concurrency_spin.setRange(1, 10)
         self.concurrency_spin.setValue(3)
-        self.concurrency_spin.setFixedWidth(70)
-        control_layout.addWidget(self.concurrency_spin)
+        self.concurrency_spin.setFixedWidth(60)
+        row1.addWidget(self.concurrency_spin)
 
-        control_layout.addSpacing(15)
+        row1.addSpacing(8)
 
         # 超时时间设置
-        timeout_label = QLabel("超时(ms):")
+        timeout_label = QLabel("超时:")
         timeout_label.setFont(QFont("", -1, QFont.Weight.Bold))
-        control_layout.addWidget(timeout_label)
+        row1.addWidget(timeout_label)
 
         self.timeout_spin = QSpinBox()
         self.timeout_spin.setRange(1000, 600000)
         self.timeout_spin.setValue(30000)
         self.timeout_spin.setSingleStep(10000)
         self.timeout_spin.setSuffix(" ms")
-        self.timeout_spin.setFixedWidth(100)
-        control_layout.addWidget(self.timeout_spin)
+        self.timeout_spin.setFixedWidth(90)
+        row1.addWidget(self.timeout_spin)
 
-        control_layout.addSpacing(15)
+        row1.addSpacing(8)
 
         # 间隔时间设置
-        interval_label = QLabel("间隔(s):")
+        interval_label = QLabel("间隔:")
         interval_label.setFont(QFont("", -1, QFont.Weight.Bold))
-        control_layout.addWidget(interval_label)
+        row1.addWidget(interval_label)
 
         self.interval_spin = QSpinBox()
-        self.interval_spin.setRange(3, 86400)  # 最小 3s，最大 24h（86400s）
+        self.interval_spin.setRange(3, 86400)
         self.interval_spin.setValue(self.DEFAULT_INTERVAL)
         self.interval_spin.setSuffix(" s")
-        self.interval_spin.setFixedWidth(100)
+        self.interval_spin.setFixedWidth(80)
         self.interval_spin.setToolTip("检测间隔（秒），支持 3 ~ 86400（24小时）\n如需更灵活的定时调度，请使用 Cron 模式 →")
-        control_layout.addWidget(self.interval_spin)
+        row1.addWidget(self.interval_spin)
 
-        # ── Cron 定时调度区域 ──────────────────
-        from PySide6.QtWidgets import QFrame
+        row1.addStretch()
 
-        # Cron 模式开关
+        # ── 高级设置折叠按钮 ──────────────────
+        self.advanced_toggle = QPushButton("⚙️ 高级设置 ▶")
+        self.advanced_toggle.setCheckable(True)
+        self.advanced_toggle.setFixedWidth(150)
+        self.advanced_toggle.setMinimumHeight(34)
+        self.advanced_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.advanced_toggle.setStyleSheet("""
+            QPushButton { background: #e6e9ef; color: #4c4f69; border: 1px solid #ccd0da;
+                          border-radius: 6px; font-weight: bold; font-size: 12px; padding: 6px 14px; }
+            QPushButton:checked { background: #dce0e8; color: #1e66f5; }
+            QPushButton:hover { background: #d0d4de; }
+        """)
+        self.advanced_toggle.toggled.connect(self._on_advanced_toggled)
+        row1.addWidget(self.advanced_toggle)
+
+        main_ctl_layout.addLayout(row1)
+
+        # ── 第2行：高级设置面板（默认折叠） ────
+        self.advanced_panel = QWidget()
+        self.advanced_panel.setVisible(False)
+        adv_layout = QHBoxLayout(self.advanced_panel)
+        adv_layout.setContentsMargins(0, 4, 0, 0)
+        adv_layout.setSpacing(8)
+
+        # ── Cron 定时调度 ──
         self.cron_mode_check = QPushButton("⏰ Cron")
         self.cron_mode_check.setCheckable(True)
-        self.cron_mode_check.setFixedWidth(70)
-        self.cron_mode_check.setMinimumHeight(32)
+        self.cron_mode_check.setFixedWidth(80)
+        self.cron_mode_check.setMinimumHeight(30)
         self.cron_mode_check.setCursor(Qt.CursorShape.PointingHandCursor)
         self.cron_mode_check.setStyleSheet("""
-            QPushButton { background: #2d2d35; color: #9ca3af; border: 1px solid #444; border-radius: 6px; font-weight: bold; }
+            QPushButton { background: #2d2d35; color: #9ca3af; border: 1px solid #444; border-radius: 6px; font-weight: bold; font-size: 12px; padding: 4px 8px; }
             QPushButton:checked { background: #2563eb; color: white; border-color: #3b82f6; }
             QPushButton:hover { background: #3d3d45; }
             QPushButton:checked:hover { background: #1d4ed8; }
         """)
-        self.cron_mode_check.setToolTip("开启后使用 Cron 表达式进行定时调度\n支持：每 N 小时、每天固定时间、每周等\n适合一天一次或更长周期的场景")
+        self.cron_mode_check.setToolTip("开启后使用 Cron 表达式进行定时调度")
         self.cron_mode_check.toggled.connect(self._on_cron_toggled)
-        control_layout.addWidget(self.cron_mode_check)
+        adv_layout.addWidget(self.cron_mode_check)
 
-        # Cron 表达式输入（默认隐藏）
         self.cron_edit = QLineEdit()
         self.cron_edit.setPlaceholderText("cron 表达式，如: 0 8 * * *")
-        self.cron_edit.setFixedWidth(150)
-        self.cron_edit.setMinimumHeight(32)
+        self.cron_edit.setFixedWidth(140)
+        self.cron_edit.setMinimumHeight(30)
         self.cron_edit.setVisible(False)
         self.cron_edit.setToolTip(
             "Cron 表达式格式: 分 时 日 月 周\n"
             "示例:\n"
             "  0 */6 * * *   → 每 6 小时\n"
-            "  0 8 * * *     → 每天 08:00\n"
-            "  0 0 * * 1     → 每周一 00:00\n"
-            "  30 9 1 * *    → 每月 1 号 09:30"
+            "  0 8 * * *     → 每天 08:00"
         )
-        control_layout.addWidget(self.cron_edit)
+        adv_layout.addWidget(self.cron_edit)
 
-        # Cron 预设按钮
         cron_presets = [
             ("每小时", "0 * * * *"),
             ("每6h", "0 */6 * * *"),
@@ -2010,127 +2266,129 @@ class WebMonitorWindow(QMainWindow):
         self.cron_preset_btns = []
         for preset_name, preset_expr in cron_presets:
             btn = QPushButton(preset_name)
-            btn.setFixedSize(52, 28)
+            btn.setFixedSize(56, 26)
             btn.setVisible(False)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.setToolTip(f"预设: {preset_expr}")
             btn.clicked.connect(lambda checked, e=preset_expr: self._apply_cron_preset(e))
             btn.setStyleSheet("""
-                QPushButton { background: #2a2a32; color: #b0b5c0; border: 1px solid #38383f; border-radius: 4px; font-size: 11px; }
+                QPushButton { background: #2a2a32; color: #b0b5c0; border: 1px solid #38383f; border-radius: 4px; font-size: 11px; padding: 2px 6px; }
                 QPushButton:hover { background: #36363f; color: white; }
             """)
             self.cron_preset_btns.append(btn)
-            control_layout.addWidget(btn)
+            adv_layout.addWidget(btn)
 
-        # Cron 预览标签
         self.cron_preview = QLabel("")
         self.cron_preview.setStyleSheet("color: #22c55e; font-size: 11px;")
         self.cron_preview.setVisible(False)
-        control_layout.addWidget(self.cron_preview)
+        adv_layout.addWidget(self.cron_preview)
 
         # 分隔线
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.VLine)
-        sep.setStyleSheet("color: #ccd0da; margin: 0 10px;")
-        control_layout.addWidget(sep)
+        sep1 = QFrame()
+        sep1.setFrameShape(QFrame.Shape.VLine)
+        sep1.setStyleSheet("color: #ccd0da; margin: 0 4px;")
+        adv_layout.addWidget(sep1)
 
-        # 资源分析开关
-        profile_label = QLabel("🔍 资源分析:")
+        # ── 资源分析开关 ──
+        profile_label = QLabel("🔍分析:")
         profile_label.setFont(QFont("", -1, QFont.Weight.Bold))
-        profile_label.setToolTip("开启后记录每个页面加载的所有资源明细\n输出 JSON 报告到 monitor_reports/ 目录")
-        control_layout.addWidget(profile_label)
+        profile_label.setToolTip("开启后记录每个页面加载的所有资源明细")
+        adv_layout.addWidget(profile_label)
 
         self.profile_check = QPushButton("OFF")
         self.profile_check.setCheckable(True)
         self.profile_check.setFixedWidth(60)
-        self.profile_check.setMinimumHeight(32)
+        self.profile_check.setMinimumHeight(30)
         self.profile_check.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.profile_check.setToolTip(
-            "开启资源分析模式\n"
-            "记录所有加载的资源（图片/CSS/JS/字体等）\n"
-            "自动保存为 JSON 报告到 monitor_reports/\n"
-            "\n"
-            "报告内容:\n"
-            "• Top 20 最慢资源\n"
-            "• 按域名聚合统计\n"
-            "• 全量资源列表（含耗时和大小）"
-        )
+        self.profile_check.setToolTip("开启资源分析模式\n记录所有加载的资源明细\n自动保存为 JSON 报告")
         self.profile_check.setStyleSheet("""
-            QPushButton {
-                background: #e5e7eb;
-                color: #374151;
-                border: 2px solid #d1d5db;
-                border-radius: 16px;
-                font-weight: bold;
-                font-size: 12px;
-                padding: 4px;
-            }
-            QPushButton:hover {
-                background: #d1d5db;
-            }
-            QPushButton:checked {
-                background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
-                    stop:0 #f59e0b, stop:1 #d97706);
-                color: white;
-                border-color: #f59e0b;
-            }
-            QPushButton:disabled {
-                background: #9ca3af;
-                color: white;
-            }
+            QPushButton { background: #e5e7eb; color: #374151; border: 2px solid #d1d5db;
+                          border-radius: 16px; font-weight: bold; font-size: 12px; padding: 2px 6px; }
+            QPushButton:hover { background: #d1d5db; }
+            QPushButton:checked { background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
+                stop:0 #f59e0b, stop:1 #d97706); color: white; border-color: #f59e0b; }
+            QPushButton:disabled { background: #9ca3af; color: white; }
         """)
-        control_layout.addWidget(self.profile_check)
+        adv_layout.addWidget(self.profile_check)
 
-        # 轮次汇总报告开关
-        round_label = QLabel("📋 汇总报告:")
+        # ── 轮次汇总报告开关 ──
+        round_label = QLabel("📋汇总:")
         round_label.setFont(QFont("", -1, QFont.Weight.Bold))
-        round_label.setToolTip("开启后每轮测试结束后自动生成汇总文件\n包含所有站点的 DOM/LOAD 数据（含失败项）\n输出 CSV + JSON 到 monitor_reports/ 目录")
-        control_layout.addWidget(round_label)
+        adv_layout.addWidget(round_label)
 
         self.round_report_check = QPushButton("OFF")
         self.round_report_check.setCheckable(True)
         self.round_report_check.setFixedWidth(60)
-        self.round_report_check.setMinimumHeight(32)
+        self.round_report_check.setMinimumHeight(30)
         self.round_report_check.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.round_report_check.setToolTip(
-            "开启轮次汇总报告\n"
-            "每轮测试完成后自动生成汇总文件\n"
-            "适合每天定时监控的数据收集场景\n"
-            "\n"
-            "输出内容:\n"
-            "• CSV 简表：域名 / DOM(ms) / LOAD(ms) / 状态\n"
-            "• JSON 完整报告：含统计摘要和全部数据\n"
-            "\n"
-            "无论成功或失败的站点都会被记录"
-        )
+        self.round_report_check.setToolTip("开启后每轮测试结束后自动生成汇总文件")
         self.round_report_check.setStyleSheet("""
-            QPushButton {
-                background: #e5e7eb;
-                color: #374151;
-                border: 2px solid #d1d5db;
-                border-radius: 16px;
-                font-weight: bold;
-                font-size: 12px;
-                padding: 4px;
-            }
-            QPushButton:hover {
-                background: #d1d5db;
-            }
-            QPushButton:checked {
-                background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
-                    stop:0 #10b981, stop:1 #059669);
-                color: white;
-                border-color: #10b981;
-            }
-            QPushButton:disabled {
-                background: #9ca3af;
-                color: white;
-            }
+            QPushButton { background: #e5e7eb; color: #374151; border: 2px solid #d1d5db;
+                          border-radius: 16px; font-weight: bold; font-size: 12px; padding: 2px 6px; }
+            QPushButton:hover { background: #d1d5db; }
+            QPushButton:checked { background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
+                stop:0 #10b981, stop:1 #059669); color: white; border-color: #10b981; }
+            QPushButton:disabled { background: #9ca3af; color: white; }
         """)
-        control_layout.addWidget(self.round_report_check)
+        adv_layout.addWidget(self.round_report_check)
 
-        control_layout.addStretch()
+        # 分隔线
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.Shape.VLine)
+        sep2.setStyleSheet("color: #ccd0da; margin: 0 4px;")
+        adv_layout.addWidget(sep2)
 
+        # ── DNS 设置 ──
+        dns_label = QLabel("🌐DNS:")
+        dns_label.setFont(QFont("", -1, QFont.Weight.Bold))
+        dns_label.setToolTip("自定义 DNS 解析（需要管理员权限）")
+        adv_layout.addWidget(dns_label)
+
+        self.dns_mode = QComboBox()
+        self.dns_mode.addItems(["系统 DNS", "自定义 DNS"])
+        self.dns_mode.setFixedWidth(110)
+        self.dns_mode.setMinimumHeight(30)
+        self.dns_mode.setStyleSheet("padding: 4px 6px;")
+        self.dns_mode.setToolTip("选择 DNS 模式\n系统 DNS：使用系统默认DNS\n自定义 DNS：启动本地代理，修改系统 DNS 指向自定义服务器")
+        self.dns_mode.currentIndexChanged.connect(self._on_dns_mode_changed)
+        adv_layout.addWidget(self.dns_mode)
+
+        self.dns_protocol = QComboBox()
+        self.dns_protocol.addItems(["UDP 53", "DOH HTTPS"])
+        self.dns_protocol.setFixedWidth(100)
+        self.dns_protocol.setMinimumHeight(30)
+        self.dns_protocol.setStyleSheet("padding: 4px 6px;")
+        self.dns_protocol.setVisible(False)
+        adv_layout.addWidget(self.dns_protocol)
+
+        self.dns_server_input = QLineEdit()
+        self.dns_server_input.setPlaceholderText("DNS 服务器地址")
+        self.dns_server_input.setFixedWidth(150)
+        self.dns_server_input.setMinimumHeight(30)
+        self.dns_server_input.setStyleSheet("padding: 4px 6px;")
+        self.dns_server_input.setVisible(False)
+        self.dns_server_input.setToolTip("UDP: 输入 DNS IP (如 223.5.5.5)\nDOH: 输入 DOH URL")
+        adv_layout.addWidget(self.dns_server_input)
+
+        self.dns_preset_btns = []
+        for key in ("alidns", "google", "cloudflare"):
+            info = DNS_PRESETS[key]
+            btn = QPushButton(info["name"])
+            btn.setFixedSize(80, 28)
+            btn.setVisible(False)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setToolTip(f"UDP: {info['udp']}\nDOH: {info['doh']}")
+            btn.clicked.connect(lambda checked, k=key: self._apply_dns_preset(k))
+            btn.setStyleSheet("""
+                QPushButton { background: #2a2a32; color: #b0b5c0; border: 1px solid #38383f; border-radius: 4px; font-size: 11px; padding: 4px 8px; }
+                QPushButton:hover { background: #36363f; color: white; }
+            """)
+            self.dns_preset_btns.append(btn)
+            adv_layout.addWidget(btn)
+
+        adv_layout.addStretch()
+
+        main_ctl_layout.addWidget(self.advanced_panel)
         main_layout.addWidget(control_group)
 
         # ======== 中间 Tab 区域 ========
@@ -2238,6 +2496,9 @@ class WebMonitorWindow(QMainWindow):
         self.profile_check.toggled.connect(self._on_profile_toggled)
         self.round_report_check.toggled.connect(self._on_round_report_toggled)
 
+        # DNS 切换
+        self.dns_protocol.currentIndexChanged.connect(self._on_dns_protocol_changed)
+
         # Cron 表达式输入时实时预览
         self.cron_edit.textChanged.connect(self._update_cron_preview)
         self.monitor_signals.record_ready.connect(self._on_record_ready)
@@ -2316,6 +2577,27 @@ class WebMonitorWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "没有可监控的网站！\n请在 site.txt 中添加URL后重启。")
             return
 
+        # 防止旧线程仍在运行时启动新线程
+        if self.worker_thread and self.worker_thread.isRunning():
+            self._append_log("⏳ 正在等待上一轮监控完全停止...")
+            self.worker_thread.stop()
+            if not self.worker_thread.wait(8000):
+                self._append_log("⚠️ 上一轮监控未能及时停止，强制继续")
+
+
+        # DNS 配置检查
+        dns_protocol, dns_upstream = self._get_dns_config()
+        if dns_protocol and not DnsProxy.check_admin():
+            QMessageBox.warning(
+                self, "权限不足",
+                "自定义 DNS 需要管理员权限才能修改系统 DNS！\n\n"
+                "请以管理员身份运行此程序（右键 → 以管理员身份运行），\n"
+                "或重启程序后自动触发 UAC 提权。\n\n"
+                "点击「确定」后将以系统 DNS 模式继续运行。"
+            )
+            self.dns_mode.setCurrentIndex(0)
+            dns_protocol, dns_upstream = "", ""
+
         # Cron 模式校验
         cron_expr = ""
         if self.cron_mode_check.isChecked():
@@ -2347,6 +2629,11 @@ class WebMonitorWindow(QMainWindow):
         self.cron_edit.setEnabled(False)
         for btn in self.cron_preset_btns:
             btn.setEnabled(False)
+        self.dns_mode.setEnabled(False)
+        self.dns_protocol.setEnabled(False)
+        self.dns_server_input.setEnabled(False)
+        for btn in self.dns_preset_btns:
+            btn.setEnabled(False)
 
         # 启动工作线程
         self.worker_thread = MonitorWorkerThread(
@@ -2357,38 +2644,26 @@ class WebMonitorWindow(QMainWindow):
             interval_sec=self.interval_spin.value(),
             enable_profiling=self.profile_check.isChecked(),
             cron_expr=cron_expr,
-            enable_round_report=self.round_report_check.isChecked()
+            enable_round_report=self.round_report_check.isChecked(),
+            dns_protocol=dns_protocol,
+            dns_upstream=dns_upstream,
         )
         self.worker_thread.finished.connect(self._on_thread_finished)
         self.worker_thread.start()
 
         profiling_status = "🔍 已开启" if self.profile_check.isChecked() else ""
         round_status = "📋 汇总已开启" if self.round_report_check.isChecked() else ""
-        extra = " ".join(filter(None, [profiling_status, round_status]))
+        dns_status = f"🌐 DNS: {dns_protocol.upper()}→{dns_upstream}" if dns_protocol else ""
+        extra = " ".join(filter(None, [profiling_status, round_status, dns_status]))
         self._append_log(f"🎬 正在启动监控... {extra}")
 
     def _on_stop(self):
         """点击停止按钮"""
         self._append_log("🛑 正在停止监控...")
 
+        self.stop_btn.setEnabled(False)
         if self.worker_thread:
             self.worker_thread.stop()
-
-        self.start_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
-        self.concurrency_spin.setEnabled(True)    # 停止后恢复可调
-        self.timeout_spin.setEnabled(True)         # 停止后恢复可调
-        self.profile_check.setEnabled(True)        # 停止后恢复可调
-        self.round_report_check.setEnabled(True)    # 停止后恢复可调
-        self.cron_mode_check.setEnabled(True)      # 恢复 Cron 开关
-        self.cron_edit.setEnabled(True)            # 恢复编辑
-
-        # 间隔时间根据 Cron 状态决定是否恢复
-        if not self.cron_mode_check.isChecked():
-            self.interval_spin.setEnabled(True)
-
-        for btn in self.cron_preset_btns:
-            btn.setEnabled(True)
 
     def _on_record_ready(self, url: str, timestamp: str, dom_load: float, load_time: float, status: str):
         """收到新记录信号"""
@@ -2428,6 +2703,11 @@ class WebMonitorWindow(QMainWindow):
             self.interval_spin.setEnabled(True)
         for btn in self.cron_preset_btns:
             btn.setEnabled(True)
+        self.dns_mode.setEnabled(True)
+        self.dns_protocol.setEnabled(True)
+        self.dns_server_input.setEnabled(True)
+        for btn in self.dns_preset_btns:
+            btn.setEnabled(True)
         self._append_log("✅ 监控已完全停止")
 
     def _on_thread_finished(self):
@@ -2443,6 +2723,11 @@ class WebMonitorWindow(QMainWindow):
         if not self.cron_mode_check.isChecked():
             self.interval_spin.setEnabled(True)
         for btn in self.cron_preset_btns:
+            btn.setEnabled(True)
+        self.dns_mode.setEnabled(True)
+        self.dns_protocol.setEnabled(True)
+        self.dns_server_input.setEnabled(True)
+        for btn in self.dns_preset_btns:
             btn.setEnabled(True)
 
     def _on_profile_toggled(self, checked: bool):
@@ -2466,6 +2751,13 @@ class WebMonitorWindow(QMainWindow):
     def _on_round_report_saved(self, timestamp: str, file_path: str, total_count: int):
         """轮次汇总报告保存完成"""
         self._append_log(f"📋 汇总已导出 → {Path(file_path).name} ({total_count} 个站点)")
+
+    # ── 高级设置折叠 ──────────────────────
+
+    def _on_advanced_toggled(self, checked: bool):
+        """展开/折叠高级设置面板"""
+        self.advanced_panel.setVisible(checked)
+        self.advanced_toggle.setText("⚙️ 高级设置 ▼" if checked else "⚙️ 高级设置 ▶")
 
     # ── Cron 定时调度相关方法 ──────────────────
 
@@ -2646,6 +2938,51 @@ class WebMonitorWindow(QMainWindow):
             QMessageBox.critical(self, "导出失败", f"❌ 导出过程中出错：\n{e}")
             self._append_log(f"❌ 导出失败: {e}")
 
+    # ── DNS 相关方法 ──────────────────────────
+
+    def _on_dns_mode_changed(self, index: int):
+        """DNS 模式切换"""
+        custom = index == 1
+        self.dns_protocol.setVisible(custom)
+        self.dns_server_input.setVisible(custom)
+        for btn in self.dns_preset_btns:
+            btn.setVisible(custom)
+        if custom:
+            self._on_dns_protocol_changed()
+            if not self.dns_server_input.text().strip():
+                self._apply_dns_preset("alidns")
+            self._append_log("🌐 已切换至自定义 DNS 模式")
+        else:
+            self._append_log("🌐 已切换至系统 DNS 模式")
+
+    def _on_dns_protocol_changed(self):
+        """DNS 协议切换时更新输入框占位符"""
+        is_doh = self.dns_protocol.currentIndex() == 1
+        if is_doh:
+            self.dns_server_input.setPlaceholderText("https://dns.example.com/dns-query")
+        else:
+            self.dns_server_input.setPlaceholderText("DNS IP (如 223.5.5.5)")
+
+    def _apply_dns_preset(self, key: str):
+        """应用 DNS 预设"""
+        info = DNS_PRESETS[key]
+        is_doh = self.dns_protocol.currentIndex() == 1
+        if is_doh:
+            self.dns_server_input.setText(info["doh"])
+        else:
+            self.dns_server_input.setText(info["udp"])
+        self._append_log(f"🌐 已选择 DNS 预设: {info['name']}")
+
+    def _get_dns_config(self) -> tuple:
+        """获取当前 DNS 配置 (protocol, upstream)"""
+        if self.dns_mode.currentIndex() == 0:
+            return ("", "")
+        is_doh = self.dns_protocol.currentIndex() == 1
+        server = self.dns_server_input.text().strip()
+        if not server:
+            return ("", "")
+        return ("doh" if is_doh else "udp", server)
+
     def closeEvent(self, event):
         """窗口关闭时的清理操作"""
         if self.worker_thread and self.worker_thread.isRunning():
@@ -2657,20 +2994,47 @@ class WebMonitorWindow(QMainWindow):
             )
             if reply == QMessageBox.StandardButton.Yes:
                 self.worker_thread.stop()
-                self.worker_thread.wait(5000)  # 等待最多5秒
-                event.accept()
             else:
                 event.ignore()
-        else:
-            event.accept()
+                return
+        # 等待线程结束（最多8秒），避免 "Destroyed while thread is still running"
+        if self.worker_thread and self.worker_thread.isRunning():
+            self.worker_thread.wait(8000)
+        event.accept()
 
 
 # ============================================================
 # 程序入口
 # ============================================================
 
+def _elevate_on_windows():
+    """自动以管理员权限重启（触发 UAC 弹窗）"""
+    try:
+        import ctypes
+        if ctypes.windll.shell32.IsUserAnAdmin():
+            return False
+        # 非管理员 → 提权重启
+        if getattr(sys, 'frozen', False):
+            # PyInstaller 打包的 EXE
+            ctypes.windll.shell32.ShellExecuteW(
+                None, "runas", sys.executable, "", None, 1
+            )
+        else:
+            # Python 脚本模式
+            ctypes.windll.shell32.ShellExecuteW(
+                None, "runas", sys.executable, f'"{sys.argv[0]}"', None, 1
+            )
+        return True
+    except Exception:
+        return False
+
+
 def main():
     """主函数"""
+    # Windows 下自动提权（UAC 弹窗）
+    if _elevate_on_windows():
+        sys.exit(0)
+
     # 高DPI支持
     if hasattr(Qt, 'HighDpiScaleFactorRoundingPolicy'):
         QApplication.setHighDpiScaleFactorRoundingPolicy(
