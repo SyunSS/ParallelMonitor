@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
     QTableWidgetItem, QHeaderView, QGroupBox, QDialog,
     QLineEdit, QTextEdit, QDialogButtonBox, QMessageBox,
     QSplitter, QFrame, QScrollArea, QFileDialog,
-    QComboBox
+    QComboBox, QStackedWidget, QListWidget, QListWidgetItem
 )
 from PySide6.QtCore import (
     Qt, QObject, Signal, QThread, QTimer, QMutex, QWaitCondition
@@ -523,6 +523,7 @@ class AsyncMonitorEngine:
         enable_round_report: bool = False,
         dns_protocol: str = "",
         dns_upstream: str = "",
+        browser_channel: str = "auto",
     ):
         self.sites = sites
         self.signals = signals
@@ -532,6 +533,7 @@ class AsyncMonitorEngine:
         self.enable_profiling = enable_profiling
         self.cron_expr = cron_expr.strip()
         self.enable_round_report = enable_round_report
+        self.browser_channel = browser_channel  # "auto" | "msedge" | "chrome" | ""
         self.sites = [self._normalize_url(u) for u in sites]
         self._playwright = None
         self._browser: Optional[Browser] = None
@@ -550,7 +552,7 @@ class AsyncMonitorEngine:
         self._running = False
 
     async def _init_browser(self):
-        """初始化浏览器实例（优先使用系统浏览器，回退到Playwright自带）"""
+        """初始化浏览器实例（根据用户选择或自动回退）"""
         if self._dns_proxy:
             try:
                 await self._dns_proxy.start()
@@ -564,11 +566,16 @@ class AsyncMonitorEngine:
             mode_msg = " + 🔍 资源分析已开启" if self.enable_profiling else ""
             self._playwright = await async_playwright().start()
 
-            # 三级回退：Edge → Chrome → Playwright Chromium
-            channels = [
-                ("msedge", "Microsoft Edge"),
-                ("chrome",  "Google Chrome"),
-            ]
+            # 根据用户选择或自动回退确定浏览器
+            if self.browser_channel == "auto":
+                channels = [
+                    ("msedge", "Microsoft Edge"),
+                    ("chrome",  "Google Chrome"),
+                ]
+            elif self.browser_channel:
+                channels = [(self.browser_channel, self.browser_channel)]
+            else:
+                channels = []  # 直接走内置 Chromium
 
             launched = False
             browser_name = ""
@@ -578,12 +585,13 @@ class AsyncMonitorEngine:
                         headless=True,
                         channel=ch,
                         args=[
+                            '--disable-blink-features=AutomationControlled',
                             '--no-sandbox',
                             '--disable-setuid-sandbox',
                             '--disable-dev-shm-usage',
                             '--disable-gpu',
-                            '--disable-http-cache',       # 禁用HTTP缓存，每次都是干净的请求
-                            '--disable-background-networking',
+                            '--disable-http-cache',
+                            '--window-position=-32000,-32000',
                         ]
                     )
                     browser_name = f"{name} ({ch})"
@@ -598,12 +606,13 @@ class AsyncMonitorEngine:
                     self._browser = await self._playwright.chromium.launch(
                         headless=True,
                         args=[
+                            '--disable-blink-features=AutomationControlled',
                             '--no-sandbox',
                             '--disable-setuid-sandbox',
                             '--disable-dev-shm-usage',
                             '--disable-gpu',
-                            '--disable-http-cache',       # 禁用HTTP缓存
-                            '--disable-background-networking',
+                            '--disable-http-cache',
+                            '--window-position=-32000,-32000',
                         ]
                     )
                     browser_name = "Playwright Chromium (内置)"
@@ -832,12 +841,16 @@ class AsyncMonitorEngine:
                     return
 
                 # 为每个请求创建独立的浏览器上下文
+                # 设置真实浏览器参数，避免被 WAF/反爬系统拦截（403/超时）
                 context = await self._browser.new_context(
                     user_agent=(
                         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                         'AppleWebKit/537.36 (KHTML, like Gecko) '
-                        'Chrome/120.0.0.0 Safari/537.36'
-                    )
+                        'Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0'
+                    ),
+                    viewport={'width': 1920, 'height': 1080},
+                    locale='zh-CN',
+                    timezone_id='Asia/Shanghai',
                 )
                 page = await context.new_page()
 
@@ -1094,6 +1107,7 @@ class MonitorWorkerThread(QThread):
         enable_round_report: bool = False,
         dns_protocol: str = "",
         dns_upstream: str = "",
+        browser_channel: str = "auto",
     ):
         super().__init__()
         self.sites = sites
@@ -1106,6 +1120,7 @@ class MonitorWorkerThread(QThread):
         self.enable_round_report = enable_round_report
         self.dns_protocol = dns_protocol
         self.dns_upstream = dns_upstream
+        self.browser_channel = browser_channel
 
         self._engine: Optional[AsyncMonitorEngine] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -1126,6 +1141,7 @@ class MonitorWorkerThread(QThread):
             enable_round_report=self.enable_round_report,
             dns_protocol=self.dns_protocol,
             dns_upstream=self.dns_upstream,
+            browser_channel=self.browser_channel,
         )
 
         try:
@@ -2043,7 +2059,7 @@ class WebMonitorWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("🔍 网页监控工具 v1.5")
+        self.setWindowTitle("🔍 网页监控工具 v1.6")
         self.setMinimumSize(1100, 750)
 
         # 设置窗口图标（内嵌，无需外部文件）
@@ -2186,6 +2202,42 @@ class WebMonitorWindow(QMainWindow):
         self.timeout_spin.setSuffix(" ms")
         self.timeout_spin.setFixedWidth(90)
         row1.addWidget(self.timeout_spin)
+
+        row1.addSpacing(8)
+
+        # 浏览器选择
+        browser_label = QLabel("浏览器:")
+        browser_label.setFont(QFont("", -1, QFont.Weight.Bold))
+        row1.addWidget(browser_label)
+
+        self.browser_combo = QComboBox()
+        self.browser_combo.addItem("自动 (Edge → Chrome)", "auto")
+        self.browser_combo.addItem("Microsoft Edge", "msedge")
+        self.browser_combo.addItem("Google Chrome", "chrome")
+        self.browser_combo.addItem("Playwright Chromium", "")
+        self.browser_combo.setFixedWidth(170)
+        self.browser_combo.setToolTip(
+            "选择监控使用的浏览器。\n"
+            "自动模式：优先 Edge，回退到 Chrome，最后使用内置 Chromium\n"
+            "如果 Edge 高版本有问题，可以装 Chrome 140 并手动选择"
+        )
+        row1.addWidget(self.browser_combo)
+
+        row1.addSpacing(8)
+
+        # 视图切换：标签页 / 列表模式
+        self.list_mode_btn = QPushButton("📋 列表")
+        self.list_mode_btn.setCheckable(True)
+        self.list_mode_btn.setFixedWidth(80)
+        self.list_mode_btn.setMinimumHeight(34)
+        self.list_mode_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.list_mode_btn.setStyleSheet("""
+            QPushButton { background: #e6e9ef; color: #4c4f69; border: 1px solid #ccd0da;
+                          border-radius: 6px; font-weight: bold; font-size: 12px; padding: 6px 8px; }
+            QPushButton:checked { background: #dce0e8; color: #1e66f5; }
+            QPushButton:hover { background: #d0d4de; }
+        """)
+        row1.addWidget(self.list_mode_btn)
 
         row1.addSpacing(8)
 
@@ -2395,7 +2447,49 @@ class WebMonitorWindow(QMainWindow):
         self.tab_widget = QTabWidget()
         self.tab_widget.setTabsClosable(False)
         self.tab_widget.setDocumentMode(True)
-        main_layout.addWidget(self.tab_widget, stretch=1)
+
+        # ── 列表模式面板 ──
+        self.list_splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # 左侧：搜索 + 站点列表
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(4, 4, 4, 4)
+
+        self.site_search = QLineEdit()
+        self.site_search.setPlaceholderText("🔍 搜索域名...")
+        self.site_search.setClearButtonEnabled(True)
+        self.site_search.setMinimumHeight(30)
+        left_layout.addWidget(self.site_search)
+
+        self.site_list = QListWidget()
+        self.site_list.setAlternatingRowColors(True)
+        self.site_list.setStyleSheet("""
+            QListWidget { background: #f5f5f9; border: 1px solid #ccd0da; border-radius: 4px; }
+            QListWidget::item { padding: 6px 8px; border-bottom: 1px solid #e0e3eb; }
+            QListWidget::item:selected { background: #dce0e8; color: #1e66f5; }
+            QListWidget::item:hover { background: #e6e9ef; }
+        """)
+        left_layout.addWidget(self.site_list)
+
+        self.list_splitter.addWidget(left_panel)
+
+        # 右侧：选中站点的内容区域
+        self.list_right_stack = QStackedWidget()
+        self.list_placeholder = QLabel("👈 请从左侧选择一个网站")
+        self.list_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.list_placeholder.setStyleSheet("color: #9ca0b0; font-size: 14px;")
+        self.list_right_stack.addWidget(self.list_placeholder)  # index 0 = placeholder
+        self.list_splitter.addWidget(self.list_right_stack)
+
+        self.list_splitter.setSizes([220, 880])
+        self.list_splitter.setVisible(False)
+
+        # ── 视口切换：StackedWidget(标签页 / 列表) ──
+        self.view_stack = QStackedWidget()
+        self.view_stack.addWidget(self.tab_widget)      # index 0: 标签页视图
+        self.view_stack.addWidget(self.list_splitter)   # index 1: 列表视图
+        main_layout.addWidget(self.view_stack, stretch=1)
 
         # ======== 底部日志区域 ========
         log_group = QGroupBox("运行日志")
@@ -2508,6 +2602,11 @@ class WebMonitorWindow(QMainWindow):
         self.monitor_signals.profile_saved.connect(self._on_profile_saved)
         self.monitor_signals.round_report_saved.connect(self._on_round_report_saved)
 
+        # 视图切换 & 列表搜索
+        self.list_mode_btn.clicked.connect(self._toggle_view_mode)
+        self.site_search.textChanged.connect(self._on_site_search)
+        self.site_list.currentRowChanged.connect(self._on_site_list_selected)
+
     @staticmethod
     def _normalize_url(url: str) -> str:
         """自动为缺少协议前缀的 URL 补上 https://"""
@@ -2553,8 +2652,9 @@ class WebMonitorWindow(QMainWindow):
             self._append_log(f"❌ 保存 site.txt 失败: {e}")
 
     def _create_tabs(self):
-        """为每个站点创建 Tab"""
+        """为每个站点创建 Tab 和列表项"""
         self.tab_widget.clear()
+        self.site_list.clear()
         self.site_tabs.clear()
 
         for url in self.sites:
@@ -2568,6 +2668,74 @@ class WebMonitorWindow(QMainWindow):
 
             self.tab_widget.addTab(tab, f"🌐 {label}")
             self.site_tabs[url] = tab
+
+            # 列表项（仅文字，不持有 SiteTab）
+            item = QListWidgetItem(f"🌐 {label}")
+            item.setData(Qt.ItemDataRole.UserRole, url)
+            self.site_list.addItem(item)
+
+        # 列表模式默认选中第一项
+        if self.site_list.count() > 0:
+            self.site_list.setCurrentRow(0)
+
+    # ========== 视图模式切换 ==========
+
+    def _toggle_view_mode(self, checked: bool):
+        """切换标签页 / 列表视图（SiteTab 在同一时间只属于一个容器）"""
+        if checked:
+            # 切换到列表模式：从 QTabWidget 取出 SiteTab，装入 list_right_stack
+            ordered_tabs = []
+            while self.tab_widget.count() > 0:
+                w = self.tab_widget.widget(0)
+                ordered_tabs.append(w)
+                self.tab_widget.removeTab(0)
+
+            # 清空 list_right_stack（保留 index 0 占位）
+            while self.list_right_stack.count() > 1:
+                self.list_right_stack.removeWidget(self.list_right_stack.widget(1))
+
+            for tab in ordered_tabs:
+                self.list_right_stack.addWidget(tab)
+
+            self.list_mode_btn.setText("📑 标签页")
+            self.list_splitter.setVisible(True)
+            self.view_stack.setCurrentIndex(1)
+
+            # 刷新列表选中项
+            if self.site_list.count() > 0:
+                self.site_list.setCurrentRow(0)
+        else:
+            # 切换回标签页模式：从 list_right_stack 取出 SiteTab，装回 QTabWidget
+            self.tab_widget.clear()
+            ordered_tabs = []
+            while self.list_right_stack.count() > 1:
+                w = self.list_right_stack.widget(1)
+                ordered_tabs.append(w)
+                self.list_right_stack.removeWidget(w)
+
+            for i, tab in enumerate(ordered_tabs):
+                item = self.site_list.item(i)
+                label = item.text() if item else "?"
+                self.tab_widget.addTab(tab, label)
+
+            self.list_mode_btn.setText("📋 列表")
+            self.list_splitter.setVisible(False)
+            self.view_stack.setCurrentIndex(0)
+
+    def _on_site_search(self, text: str):
+        """搜索过滤站点列表"""
+        query = text.strip().lower()
+        for i in range(self.site_list.count()):
+            item = self.site_list.item(i)
+            url = item.data(Qt.ItemDataRole.UserRole) or ""
+            label = item.text().lower()
+            item.setHidden(bool(query and query not in label and query not in url.lower()))
+
+    def _on_site_list_selected(self, index: int):
+        """列表选中站点：显示对应的 SiteTab"""
+        # index 0 = list placeholder, so site is at stack index = index + 1
+        site_stack_idx = index + 1 if hasattr(self, 'list_right_stack') and self.list_right_stack.count() > index + 1 else 0
+        self.list_right_stack.setCurrentIndex(site_stack_idx)
 
     # ========== 槽函数 ==========
 
@@ -2634,6 +2802,8 @@ class WebMonitorWindow(QMainWindow):
         self.dns_server_input.setEnabled(False)
         for btn in self.dns_preset_btns:
             btn.setEnabled(False)
+        self.browser_combo.setEnabled(False)
+        self.list_mode_btn.setEnabled(False)
 
         # 启动工作线程
         self.worker_thread = MonitorWorkerThread(
@@ -2647,6 +2817,7 @@ class WebMonitorWindow(QMainWindow):
             enable_round_report=self.round_report_check.isChecked(),
             dns_protocol=dns_protocol,
             dns_upstream=dns_upstream,
+            browser_channel=self.browser_combo.currentData(),
         )
         self.worker_thread.finished.connect(self._on_thread_finished)
         self.worker_thread.start()
@@ -2708,6 +2879,8 @@ class WebMonitorWindow(QMainWindow):
         self.dns_server_input.setEnabled(True)
         for btn in self.dns_preset_btns:
             btn.setEnabled(True)
+        self.browser_combo.setEnabled(True)
+        self.list_mode_btn.setEnabled(True)
         self._append_log("✅ 监控已完全停止")
 
     def _on_thread_finished(self):
@@ -2729,6 +2902,8 @@ class WebMonitorWindow(QMainWindow):
         self.dns_server_input.setEnabled(True)
         for btn in self.dns_preset_btns:
             btn.setEnabled(True)
+        self.browser_combo.setEnabled(True)
+        self.list_mode_btn.setEnabled(True)
 
     def _on_profile_toggled(self, checked: bool):
         """资源分析开关切换"""
